@@ -156,6 +156,12 @@ struct SessionWriteOptions {
     SessionPhase phase;
     // tests: return an errno value to make a step fail ("write", "file_flush", "rename", "dir_flush"), 0 to go on
     std::function<int(const char* step)> fault;
+    // kv-export: write these checkpoints (by reference, in this order) instead of the image's own list, so a save
+    // need not copy the deepest checkpoint (118 MB at this geometry) twice before writing it
+    std::optional<std::vector<const ConversationCheckpoint*>> checkpoints;
+    // kv-export: hand each full 16 MiB block to a writer thread and fill the next meanwhile (the disk then overlaps
+    // the hashing and the K/V reads); off when the second block cannot be allocated
+    bool write_behind = true;
 };
 
 // Writes a temporary file beside `path` (a unique hidden name, created exclusively: never an existing file or link;

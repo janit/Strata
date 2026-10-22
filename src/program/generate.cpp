@@ -11591,15 +11591,35 @@ int main(int argc, char** argv) {
                                   " MiB needed, " + ram_note(mem) + ")";
                             return false;
                         };
-                        std::vector<ConvCheckpoint> disk_checks;
+                        // kv-export: the deepest checkpoint goes into the file by reference (the chain is not
+                        // touched while the engine writes), so nothing is copied for it: the preflight counts no copy
+                        const ConvCheckpoint* deepest = strata::core::session_deepest_checkpoint(*src_checks);
                         std::string why;
-                        if (!strata::core::session_save_checkpoints(*src_checks, sl, admit, disk_checks, why)) {
+                        if (!admit(strata::core::session_save_peak_bytes(nullptr, sl), why)) {
                             refuse(why, strata::core::SessionError::memory);
                             continue;
                         }
-                        kept = disk_checks.size();
+                        // what the view checked for a checkpoint it carried: a prefix of the live tokens and of
+                        // their pictures, one carve's state
+                        auto same_pictures = [&](const ConvCheckpoint& c) {
+                            size_t k = 0;
+                            for (const auto& key : *src_imgs) {
+                                if ((uint64_t) key.start >= c.ids.size()) break;
+                                if (k >= c.imgs.size() || !(c.imgs[k++] == key)) return false;
+                            }
+                            return k == c.imgs.size();
+                        };
+                        if (deepest && (!deepest->stage_parts.empty() || deepest->ids.empty() || !same_pictures(*deepest) ||
+                                        deepest->ids.size() > src_ids->size() ||
+                                        !std::equal(deepest->ids.begin(), deepest->ids.end(), src_ids->begin()) ||
+                                        !strata::core::conversation_checkpoint_validate(*deepest, *src_ss, g, err))) {
+                            refuse(err.empty() ? std::string("the deepest checkpoint is not a live token prefix") : err);
+                            continue;
+                        }
+                        kept = deepest ? 1 : 0;
                         checks_ms = ms();
-                        const strata::core::ConversationView view{*src_ids, *src_imgs, disk_checks, src_cvec};
+                        static const std::vector<ConvCheckpoint> no_checks;
+                        const strata::core::ConversationView view{*src_ids, *src_imgs, no_checks, src_cvec};
                         strata::core::SavedConversation meta;
                         std::vector<strata::core::SessionKvSource> sources;
                         // the live running state comes off the device in one synchronous copy
@@ -11614,6 +11634,8 @@ int main(int argc, char** argv) {
                         wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
                         wo.progress = moving;
                         wo.phase = blocking;
+                        wo.checkpoints.emplace();
+                        if (deepest) wo.checkpoints->push_back(deepest);
                         strata::core::SessionStatus& st = save_st;
                         if (!strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st)) {
                             refuse(err, st.error, st.published);

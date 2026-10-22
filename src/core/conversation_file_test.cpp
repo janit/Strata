@@ -3,6 +3,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -209,6 +210,39 @@ int main() {
         size_t read = 0;
         check(session_file_read(parked.string(), id, back, read, error) && same(one, back), "parked file reads back");
         check(original.checkpoints.size() == 2, "parked write leaves the image untouched");
+    }
+    // kv-export: the writer thread (write_behind, on by default) writes the same bytes as writing each block in place
+    {
+        const fs::path behind = dir / "behind.bin", inplace = dir / "inplace.bin";
+        size_t bw = 0, iw = 0;
+        SessionWriteOptions sync_opt;
+        sync_opt.write_behind = false;
+        std::vector<uint64_t> reports;
+        SessionWriteOptions behind_opt;
+        behind_opt.progress = [&](uint64_t done, uint64_t) { reports.push_back(done); };
+        check(session_file_write(behind.string(), original, id, bw, error, behind_opt), "write-behind write");
+        check(session_file_write(inplace.string(), original, id, iw, error, sync_opt), "in-place write");
+        check(bw == iw && slurp(behind) == slurp(inplace), "write-behind writes the same bytes");
+        check(reports.size() >= 3 && reports.front() == 0 && reports.back() == bw &&
+                  std::is_sorted(reports.begin(), reports.end()), "write-behind progress rises to the file size");
+    }
+    // kv-export: checkpoints by reference write the same file as the image holding copies of them
+    {
+        const fs::path byref = dir / "byref.bin", copied = dir / "copied.bin";
+        size_t rw = 0, cw = 0;
+        SavedConversation bare = sample();
+        const std::vector<ConversationCheckpoint> chain = std::move(bare.checkpoints);
+        bare.checkpoints.clear();
+        SessionWriteOptions opt;
+        opt.checkpoints = std::vector<const ConversationCheckpoint*>{&chain[1]};
+        check(session_file_write(byref.string(), bare, id, rw, error, opt), "write with checkpoints by reference");
+        SavedConversation one = sample();
+        one.checkpoints.erase(one.checkpoints.begin());
+        check(session_file_write(copied.string(), one, id, cw, error), "write with the checkpoint copied");
+        check(rw == cw && slurp(byref) == slurp(copied), "checkpoints by reference write the same bytes");
+        check(!session_file_write((dir / "both.bin").string(), original, id, rw, error, opt) &&
+                  error.find("both") != std::string::npos, "checkpoints in the image and the options are refused");
+        error.clear();
     }
     // writing twice produces the same bytes (deterministic format)
     {

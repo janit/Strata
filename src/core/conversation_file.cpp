@@ -4,6 +4,7 @@
 #include <bit>
 #include <cerrno>
 #include <chrono>
+#include <thread>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -527,7 +528,10 @@ bool free_space(const std::string& path, uint64_t& out) {
 
 class FileSink {
 public:
-    explicit FileSink(RawFile& f) : buf_(aligned_block()), f_(f) {}
+    explicit FileSink(RawFile& f, bool write_behind = false) : buf_(aligned_block()), f_(f) {
+        if (write_behind) spare_ = aligned_block();   // none: blocks are written in place, as before
+    }
+    ~FileSink() { if (pending_.joinable()) pending_.join(); }   // a failed write never reached finish()
     bool ok() const { return buf_ != nullptr; }
     std::string error() const {
         if (!buf_) return "out of memory for the write buffer";
@@ -551,6 +555,7 @@ public:
     }
     // last block padded to the alignment for direct I/O, then the file cut back to its exact size and flushed
     bool finish(bool durable) {
+        if (!settle()) { f_.close(); return false; }
         if (!f_.is_open()) return false;
         if (fault_) { f_.close(); return false; }
         const size_t padded = f_.direct() ? (used_ + kAlign - 1) / kAlign * kAlign : used_;
@@ -572,12 +577,35 @@ private:
     void fail_with(int e) { fault_ = true; fault_kind_ = errno_kind(e); fault_msg_ = std::strerror(e); }
     bool drain() {
         if (write_fault) { fail_with(write_fault); return false; }
+        if (spare_) {
+            // write-behind: the full block goes to the writer thread; the previous one must have landed first (one
+            // write in flight, in file order)
+            if (!settle()) return false;
+            std::swap(buf_, spare_);
+            pending_n_ = used_;
+            pending_total_ = total_;
+            pending_ = std::thread([this] { pending_ok_ = f_.write_all(spare_.get(), pending_n_); });
+            used_ = 0;
+            return true;
+        }
         if (!f_.write_all(buf_.get(), used_)) return false;
         used_ = 0;
         if (progress) (*progress)(total_, expected);
         return true;
     }
-    Aligned buf_;
+    // the block in flight has landed (or there is none); its progress is reported here, on the caller's thread
+    bool settle() {
+        if (!pending_.joinable()) return true;
+        pending_.join();
+        if (!pending_ok_) return false;
+        if (progress) (*progress)(pending_total_, expected);
+        return true;
+    }
+    Aligned buf_, spare_;
+    std::thread pending_;
+    bool pending_ok_ = true;
+    size_t pending_n_ = 0;
+    uint64_t pending_total_ = 0;
     RawFile& f_;
     bool fault_ = false;
     SessionError fault_kind_ = SessionError::io;
@@ -698,11 +726,14 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
 }
 
 void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr,
-                 bool deepest_only = false) {
+                 bool deepest_only = false, const std::vector<const ConversationCheckpoint*>* checks = nullptr) {
     for (int64_t g : s.geometry) o.i64(g);
     o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
     put_checkpoint(o, s.live);
-    if (deepest_only) {   // kv-export: a parked image keeps its chain; the file keeps what a save keeps
+    if (checks) {
+        o.u64(checks->size());
+        for (const ConversationCheckpoint* c : *checks) put_checkpoint(o, *c);
+    } else if (deepest_only) {   // kv-export: a parked image keeps its chain; the file keeps what a save keeps
         const ConversationCheckpoint* d = session_deepest_checkpoint(s.checkpoints);
         o.u64(d ? 1 : 0);
         if (d) put_checkpoint(o, *d);
@@ -1058,8 +1089,14 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     st.error = SessionError::invalid;   // refusals before any disk access
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
+    const std::vector<const ConversationCheckpoint*>* checks = opt.checkpoints ? &*opt.checkpoints : nullptr;
+    if (checks && (deepest_only || !image.checkpoints.empty())) {
+        error = "session file: checkpoints given both in the image and in the options";
+        return false;
+    }
+    if (checks) for (const auto* c : *checks) if (!c) { error = "session file: a null checkpoint"; return false; }
     Out sizing;
-    put_payload(sizing, image, sources, deepest_only);
+    put_payload(sizing, image, sources, deepest_only, checks);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
         sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: the state is too large for this build";
@@ -1086,7 +1123,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
         error = "session file: cannot create a temporary file beside " + path + ": " + error;
         return false;
     }
-    FileSink f(raw);
+    FileSink f(raw, opt.write_behind);
     if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
     if (opt.progress) f.progress.emplace(opt.progress);
     f.phase = opt.phase;
@@ -1102,7 +1139,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     Out out;
     out.f = &f;
     out.hash = &hash;
-    if (ok) put_payload(out, image, sources, deepest_only);
+    if (ok) put_payload(out, image, sources, deepest_only, checks);
     ok = ok && out.ok && out.n == payload;
     if (ok) {
         const uint64_t ph = hash.digest();
