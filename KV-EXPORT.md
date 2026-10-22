@@ -58,8 +58,8 @@ save/restore. Upstream's `/slots/0?action=save|restore` still refuse parallel re
 | 50k-token conversation | |
 |---|---|
 | session file | 1.0 GB (about 20 KiB per token) |
-| save | 0.68 s, blocking every slot of the engine (ext4; tmpfs is slower, 1.12 s) |
-| save, split | checkpoints 81 ms, live state off the device 152 ms, K/V streamed into the file and written 450 ms |
+| save | 0.56 s, blocking every slot of the engine (ext4; tmpfs is slower). It was 0.80 s before the two changes below |
+| save, split | live state off the device 80–90 ms; K/V off the device 65–120 ms; payload hash 170 ms; disk the rest |
 | import | 0.92–1.5 s, holding the engine |
 | next turn after import | 0.8–2.0 s, against 41 s cold; output identical to the original host |
 
@@ -67,27 +67,41 @@ Consecutive turns' files differ in 240 MB of 1.0 GB. The K/V is byte-identical u
 point; the running state (118 MB fp32) is rewritten twice, in the live copy and in the deepest
 checkpoint. The checkpoint matters: a client that re-renders the last reply resumes from it.
 
-## Next: a shorter save
+## A shorter save
 
-The save pauses every slot, and its write phase grows with the conversation (about 2 s at 200k).
-The engine log now splits the write into K/V reads (device to host) and disk. Which of the two
-dominates decides the approach:
+Two changes, both in the session writer and both producing the same bytes (pinned by tests):
 
-- **Disk dominates:** write only what changed. Keep a 64 KiB page hash list per save and compare
-  the K/V read from the device against it, then write the running state plus the K/V from the
-  first changed page. This is verified by content, so no tracking of where the engine rewrites
-  K/V is needed, and a wrong guess cannot write a valid-looking file with stale contents.
-- **Device reads dominate:** stage through pinned memory, and/or track the first rewritten cell
-  per source (the solo path's `read_from`, the batch admissions, conversation swaps, the draft)
-  to skip reading the unchanged prefix at all. This is faster but riskier: every K/V writer must
-  be covered.
+- **The deepest checkpoint by reference** (`SessionWriteOptions::checkpoints`). A save copied it
+  (118 MB) twice before writing it. The engine now checks it as the view did, as a prefix of the
+  live tokens and pictures with one carve's state.
+- **Write-behind** (`SessionWriteOptions::write_behind`, on by default). Each full 16 MiB block
+  goes to a writer thread while the next one is filled, so the disk overlaps the K/V reads and the
+  hashing.
 
-Background writing (capture to RAM, reply, write the file afterwards) does not help as things
-stand: a parking capture of the same 50k conversation takes 0.78–0.97 s.
+A live save and a save of the same conversation after it was parked go through different code. In
+one process they wrote byte-identical files, which is the correctness check that does not depend on
+the engine being deterministic. It is not: two fresh processes given the same prompt write
+different files (one token more, K/V that differs from about cell 49,152). Compare continuations
+across processes by their answers, not their bytes.
+
+On teddy (a 97% full NVMe, 1.2–1.3 GB/s direct writes) a save is now disk-bound: hashing on the
+writer thread instead was no faster, and on a faster disk it would be slower. To go below 0.5 s
+per GB, write fewer bytes:
+
+- **Incremental save:** the running state plus the K/V from the first changed page. Either keep a
+  page hash list per save and compare by content (safe; costs a full K/V read, 65–120 ms), or track
+  the first rewritten cell per source (faster; every K/V writer must be covered, or a valid-looking
+  file has stale contents).
+- **No file at all:** stream the save to the replicating process, which sends only what the
+  receiver lacks. That needs a stream target instead of `Publisher`'s temporary file and rename.
 
 ## Tests
 
 - `serve/test_kv_export.py`: session header, ids hash vector, the session memory, save solo and
   in parallel (which slot is chosen, 404, 409, the control lines given back), import solo and in
   parallel.
-- `src/core/conversation_file_test.cpp`: `session_ids_fnv1a64` against the same vector.
+- `src/core/conversation_file_test.cpp`: `session_ids_fnv1a64` against the same vector; a parked
+  image's file equals the file of the image holding only its deepest checkpoint; write-behind and
+  in-place writes are byte-identical; checkpoints by reference equal checkpoints copied into the
+  image. It also runs under ThreadSanitizer, except the address-space limit test, which
+  ThreadSanitizer cannot run.
