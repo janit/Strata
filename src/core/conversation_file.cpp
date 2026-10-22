@@ -616,7 +616,12 @@ private:
 
 class FileSource {
 public:
-    explicit FileSource(RawFile& f) : buf_(aligned_block()), f_(f) {}
+    // kv-export: read_ahead - a reader thread fills the next 16 MiB block while the caller parses (copies and hashes)
+    // the current one; off when the second block cannot be allocated
+    explicit FileSource(RawFile& f, bool read_ahead = true) : buf_(aligned_block()), f_(f) {
+        if (read_ahead) spare_ = aligned_block();
+    }
+    ~FileSource() { if (ahead_.joinable()) ahead_.join(); }   // a refused parse stops before the end
     bool ok() const { return buf_ != nullptr; }
     std::string error() const { return buf_ ? f_.error() : std::string("out of memory for the read buffer"); }
     SessionError kind() const { return buf_ ? f_.kind() : SessionError::memory; }
@@ -633,22 +638,47 @@ public:
     std::optional<Ticker> progress;
     uint64_t expected = 0;
 private:
+    // one block into dst: its bytes (0 at the end of the file), -1 on an error
+    long long read_block(uint8_t* dst) {
+        size_t have = 0;
+        while (have < kBlock) {
+            const long long r = f_.read_some(dst + have, kBlock - have);
+            if (r < 0) return -1;
+            if (r == 0) break;
+            have += (size_t) r;
+            if (f_.direct() && have % kAlign) break;   // short aligned read: end of file
+        }
+        return (long long) have;
+    }
+    void read_ahead() {
+        ahead_ = std::thread([this] { ahead_n_ = read_block(spare_.get()); });
+    }
     bool fill() {
         at_ = have_ = 0;
-        while (have_ < kBlock) {
-            const long long r = f_.read_some(buf_.get() + have_, kBlock - have_);
-            if (r < 0) return false;
-            if (r == 0) break;
-            have_ += (size_t) r;
-            if (f_.direct() && have_ % kAlign) break;   // short aligned read: end of file
+        long long n;
+        if (!spare_) {
+            n = read_block(buf_.get());
+        } else {
+            if (!ahead_.joinable()) {                  // the first block: read here, the next one ahead
+                n = read_block(buf_.get());
+            } else {
+                ahead_.join();
+                std::swap(buf_, spare_);
+                n = ahead_n_;
+            }
+            if (n == (long long) kBlock) read_ahead(); // a whole block: there may be more
         }
+        if (n < 0) return false;
+        have_ = (size_t) n;
         const uint64_t before = total_;
         total_ += have_;
         if (progress && total_ > before) (*progress)(total_, expected);
         return have_ > 0;
     }
-    Aligned buf_;
+    Aligned buf_, spare_;
     RawFile& f_;
+    std::thread ahead_;
+    long long ahead_n_ = 0;
     size_t at_ = 0, have_ = 0;
     uint64_t total_ = 0;
 };

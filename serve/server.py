@@ -24,6 +24,7 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+import array
 import contextlib
 import collections
 import base64
@@ -762,6 +763,7 @@ FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed ou
 # conversation it ends in can be saved by name afterwards (POST /slots/session?action=save)
 KV_SESSION = threading.local()
 KV_SESSIONS_KEPT = 1024
+KV_SESSIONS_BYTES = 64 << 20    # their prompts, packed int32: 64 MiB is ~16M tokens (~320 conversations of 50k)
 
 
 def kv_session_id(headers) -> str | None:
@@ -773,10 +775,14 @@ def kv_session_id(headers) -> str | None:
 
 def fnv1a64_ids(ids) -> int:
     """kv-export: FNV-1a 64 over the token ids as little-endian int32, as the engine's SAVEC computes it."""
+    data = (ids if isinstance(ids, array.array) and ids.typecode == "i" else array.array("i", ids)).tobytes()
+    if sys.byteorder != "little":
+        a = array.array("i", data)
+        a.byteswap()
+        data = a.tobytes()
     h = 0xcbf29ce484222325
-    for v in ids:
-        for b in (int(v) & 0xffffffff).to_bytes(4, "little"):
-            h = ((h ^ b) * 0x100000001b3) & 0xffffffffffffffff
+    for b in data:
+        h = ((h ^ b) * 0x100000001b3) & 0xffffffffffffffff
     return h
 
 
@@ -2118,7 +2124,7 @@ class StrataEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
-    def session_file(self, action: str, path: str, conv: tuple[int, list[int]] | None = None) -> dict:
+    def session_file(self, action: str, path: str, conv: tuple[int, int, int] | None = None) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
@@ -2134,10 +2140,11 @@ class StrataEngine:
             raise ValueError("invalid session command")
         if conv is not None and action != "save":
             raise ValueError("invalid session command")
-        # kv-export: `conv` = (where, prompt ids): SAVEC saves the conversation that starts with those ids from batch
-        # slot `where` (or the live session, -1), and the engine refuses if it is no longer held there
+        # kv-export: `conv` = (where, n, hash): SAVEC saves the conversation whose first n ids hash to `hash`
+        # (fnv1a64_ids) from batch slot `where` (or the live session, -1, else a parked one), and the engine refuses
+        # if it is no longer held there
         cmd = f"{action.upper()} {path}\n" if conv is None else \
-            f"SAVEC {int(conv[0])} {len(conv[1])} {fnv1a64_ids(conv[1]):016x} {path}\n"
+            f"SAVEC {int(conv[0])} {int(conv[1])} {int(conv[2]):016x} {path}\n"
         try:
             with getattr(self, "wlock", None) or contextlib.nullcontext():
                 self.proc.stdin.write(cmd)
@@ -3326,19 +3333,21 @@ class Service:
         eng = self.engine
         if not self.loaded():
             return error(503, "the model is not loaded")
+        name = fnv1a64_ids(ids)                         # ~36 ms per 50k tokens: before the control lines, not inside
         try:
             if getattr(eng, "batch", 0):
                 with eng.slot_cv:                           # the idle slot holding the longest start with these ids
                     where, held = -1, 0
                     for b in range(eng.batch):
                         h = eng.slot_held[b]
-                        if not eng.slot_busy[b] and len(h) >= len(ids) and len(h) > held and h[:len(ids)] == ids:
+                        if (not eng.slot_busy[b] and len(h) >= len(ids) and len(h) > held and
+                                array.array("i", h[:len(ids)]) == ids):
                             where, held = b, len(h)
-                r = self.with_control(lambda: eng.session_file("save", path, (where, ids)))
+                r = self.with_control(lambda: eng.session_file("save", path, (where, len(ids), name)))
             else:
                 where = -1
                 with self.fifo:
-                    r = eng.session_file("save", path, (where, ids))
+                    r = eng.session_file("save", path, (where, len(ids), name))
         except SessionRefused as e:
             code = 409 if "no longer held" in str(e) or "decoding" in str(e) else e.status
             body = error(code, str(e))
@@ -3351,15 +3360,20 @@ class Service:
 
     def kv_note(self, sid, ids) -> None:
         """kv-export: the conversation client session `sid` continues starts with these ids (the last
-        KV_SESSIONS_KEPT sessions), for POST /slots/session?action=save."""
+        KV_SESSIONS_KEPT sessions, at most KV_SESSIONS_BYTES of ids), for POST /slots/session?action=save."""
         if not sid:
             return
+        packed = array.array("i", ids)              # 4 bytes a token (a list of ints is ~36)
         with self.status_lock:
             kept = self.__dict__.setdefault("kv_sessions", collections.OrderedDict())
-            kept[sid] = list(ids)
-            kept.move_to_end(sid)
-            while len(kept) > KV_SESSIONS_KEPT:
-                kept.popitem(last=False)
+            old = kept.pop(sid, None)
+            self.kv_sessions_bytes = self.__dict__.get("kv_sessions_bytes", 0) + packed.itemsize * len(packed) - \
+                (old.itemsize * len(old) if old is not None else 0)
+            kept[sid] = packed
+            # the oldest sessions go first; the newest stays even when it alone is over the budget
+            while len(kept) > 1 and (len(kept) > KV_SESSIONS_KEPT or self.kv_sessions_bytes > KV_SESSIONS_BYTES):
+                _, gone = kept.popitem(last=False)
+                self.kv_sessions_bytes -= gone.itemsize * len(gone)
 
     def with_control(self, fn):
         """kv-export: fn() while holding the engine's control lines, as an admission does (parallel requests only):

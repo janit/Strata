@@ -17,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
+from serve import server  # noqa: E402
 from serve.server import (KV_SESSIONS_KEPT, ByteTokenizer, Service, StrataEngine, fnv1a64_ids,  # noqa: E402
                           kv_session_id, serve)
 
@@ -122,6 +123,7 @@ class KvExport(unittest.TestCase):
         self.engine.refuse = None
         self.engine.proc = FakeProc(self.engine)
         self.svc.__dict__.pop("kv_sessions", None)
+        self.svc.__dict__.pop("kv_sessions_bytes", None)
 
     def post(self, path, body):
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
@@ -144,8 +146,24 @@ class KvExport(unittest.TestCase):
         kept = self.svc.kv_sessions
         self.assertEqual(len(kept), KV_SESSIONS_KEPT)
         self.assertNotIn("s0", kept)
-        self.assertEqual(kept["s10"], [10, 11])
+        self.assertEqual(list(kept["s10"]), [10, 11])
         self.assertEqual(next(reversed(kept)), "s10")
+        self.assertEqual(self.svc.kv_sessions_bytes, sum(4 * len(v) for v in kept.values()))
+
+    def test_sessions_kept_fit_their_byte_budget(self):
+        old = server.KV_SESSIONS_BYTES
+        server.KV_SESSIONS_BYTES = 4 * 1000             # 1000 tokens
+        try:
+            for i in range(5):
+                self.svc.kv_note(f"s{i}", range(300))   # 1200 bytes each: three fit
+            self.assertEqual(list(self.svc.kv_sessions), ["s2", "s3", "s4"])
+            self.svc.kv_note("s3", range(100))          # the same session again, shorter: counted once
+            self.assertEqual(self.svc.kv_sessions_bytes, 4 * 700)
+            self.svc.kv_note("big", range(5000))        # alone over the budget: kept, everything else goes
+            self.assertEqual(list(self.svc.kv_sessions), ["big"])
+            self.assertEqual(self.svc.kv_sessions_bytes, 4 * 5000)
+        finally:
+            server.KV_SESSIONS_BYTES = old
 
     def test_solo_save_names_the_conversation_by_its_prompt(self):
         self.svc.kv_note("s1", [5, 6, 7])
