@@ -765,7 +765,8 @@ KV_SESSIONS_KEPT = 1024
 
 
 def kv_session_id(headers) -> str | None:
-    sid = (headers.get("X-Session-Id") or headers.get("X-Session-Affinity") or "").strip()
+    # the order viiwork routes by (internal/proxy sessionKey): X-Session-Affinity, then X-Session-Id
+    sid = (headers.get("X-Session-Affinity") or headers.get("X-Session-Id") or "").strip()
     return sid[:256] if sid and all(32 < ord(c) < 127 for c in sid) else None
 
 
