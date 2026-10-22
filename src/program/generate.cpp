@@ -11503,12 +11503,48 @@ int main(int argc, char** argv) {
                         if (batch_mtp && (size_t) savec_slot < slot_mtp.size()) src_draft = &slot_mtp[(size_t) savec_slot]->kv_state();
                     }
                     if (savec) {
-                        const bool fits = savec_n > 0 && (size_t) savec_n <= src_ids->size();
-                        if (!fits || strata::core::session_ids_fnv1a64(src_ids->data(), (size_t) savec_n) != savec_hash) { refuse("that conversation is no longer held there"); continue; }
+                        auto names = [&](const std::vector<int32_t>& ids) {
+                            return savec_n > 0 && (size_t) savec_n <= ids.size() &&
+                                   strata::core::session_ids_fnv1a64(ids.data(), (size_t) savec_n) == savec_hash;
+                        };
+                        if (!(src_ok && names(*src_ids))) {
+                            // kv-export: the live session moved on (another conversation's request took it and parked
+                            // this one): save the longest parked conversation it names, straight from RAM.  The file
+                            // is the one a SAVE of it as the live session writes (only the deepest checkpoint).
+                            const strata::core::SavedConversation* parked = nullptr;
+                            for (size_t i = 0; savec_slot < 0 && i < conversations.size(); ++i) {
+                                const auto& e = conversations.at(i);
+                                if (e.stage_images.empty() && e.live.imgs.empty() && names(e.live.ids) &&
+                                    (!parked || e.live.ids.size() > parked->live.ids.size())) parked = &e;
+                            }
+                            if (!parked) { refuse("that conversation is no longer held there"); continue; }
+                            size_t bytes = 0;
+                            strata::core::SessionWriteOptions wo;
+                            wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                            wo.progress = moving;
+                            wo.phase = blocking;
+                            strata::core::SessionStatus st;
+                            try {
+                                if (!strata::core::session_file_write_parked(path, *parked, id, bytes, err, wo, &st)) {
+                                    refuse(err, st.error, st.published);
+                                    continue;
+                                }
+                            } catch (const std::bad_alloc&) {
+                                refuse("not enough RAM to save the session", strata::core::SessionError::memory);
+                                continue;
+                            }
+                            std::fprintf(stderr, "strata serve: session saved %zu tokens (parked), %zu bytes to %s in "
+                                         "%.1f ms (disk %.1f ms)\n", parked->live.ids.size(), bytes, path.c_str(), ms(),
+                                         st.disk_ms);
+                            std::printf("SAVED %zu %zu %.1f\n", parked->live.ids.size(), bytes, ms());
+                            std::fflush(stdout);
+                            continue;
+                        }
                     }
                     if (!src_ok || src_ids->empty()) { refuse("no complete session to save"); continue; }
                     size_t bytes = 0, kept = 0;
                     double capture_ms = 0, checks_ms = 0;   // kv-export: where a save's pause goes
+                    strata::core::SessionStatus save_st;
                     try {
                         // RAM PREFLIGHT for the save (not a reservation), BEFORE anything is copied: the deepest
                         // checkpoint is chosen by reference, and the copies it will take (the list below and the one
@@ -11578,7 +11614,7 @@ int main(int argc, char** argv) {
                         wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
                         wo.progress = moving;
                         wo.phase = blocking;
-                        strata::core::SessionStatus st;
+                        strata::core::SessionStatus& st = save_st;
                         if (!strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st)) {
                             refuse(err, st.error, st.published);
                             continue;
@@ -11592,9 +11628,10 @@ int main(int argc, char** argv) {
                     }
                     const double total_ms = ms();
                     std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
-                                 "in %.1f ms (state %.1f ms: checkpoints %.1f, live %.1f; write %.1f ms)\n",
-                                 src_ids->size(), kept, src_checks->size(), bytes, path.c_str(), total_ms, capture_ms,
-                                 checks_ms, capture_ms - checks_ms, total_ms - capture_ms);
+                                 "in %.1f ms (state %.1f ms: checkpoints %.1f, live %.1f; write %.1f ms: K/V reads %.1f, "
+                                 "disk %.1f)\n", src_ids->size(), kept, src_checks->size(), bytes, path.c_str(), total_ms,
+                                 capture_ms, checks_ms, capture_ms - checks_ms, total_ms - capture_ms,
+                                 save_st.source_ms, save_st.disk_ms);
                     std::printf("SAVED %zu %zu %.1f\n", src_ids->size(), bytes, ms());
                 } else {
                     strata::core::SavedConversation image;

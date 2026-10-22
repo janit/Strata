@@ -195,6 +195,21 @@ int main() {
         check(read == written, "read reports the file size");
         check(same(original, back), "round trip is identical");
     }
+    // kv-export: a parked image keeps its chain; its file keeps only the deepest checkpoint, byte for byte the file
+    // of the same image holding that checkpoint alone
+    {
+        const fs::path parked = dir / "parked.bin", alone = dir / "alone.bin";
+        size_t pw = 0, aw = 0;
+        check(session_file_write_parked(parked.string(), original, id, pw, error), "parked write succeeds");
+        SavedConversation one = sample();
+        one.checkpoints.erase(one.checkpoints.begin());   // sample(): checkpoints at 10 and 500 tokens
+        check(session_file_write(alone.string(), one, id, aw, error), "write of the deepest alone");
+        check(pw == aw && slurp(parked) == slurp(alone), "parked write keeps only the deepest checkpoint");
+        SavedConversation back;
+        size_t read = 0;
+        check(session_file_read(parked.string(), id, back, read, error) && same(one, back), "parked file reads back");
+        check(original.checkpoints.size() == 2, "parked write leaves the image untouched");
+    }
     // writing twice produces the same bytes (deterministic format)
     {
         const fs::path again = dir / "again.bin";

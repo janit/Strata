@@ -296,6 +296,8 @@ public:
             if (serials_[i] == serial) return i;
         return SIZE_MAX;
     }
+    // kv-export: the parked entries in order (oldest first), for a lookup by something other than a prompt
+    const SavedConversation& at(size_t index) const { return entries_.at(index); }
     const SavedConversation* find(uint64_t serial) const {
         const size_t i = index_of(serial);
         return i == SIZE_MAX ? nullptr : &entries_[i];

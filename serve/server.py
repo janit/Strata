@@ -3310,7 +3310,8 @@ class Service:
     def session_save(self, action, filename, session, error) -> tuple[int, dict]:
         """kv-export: POST /slots/session?action=save {"session": ID, "filename": NAME} saves the conversation the
         client session ID last continued (its requests carried X-Session-Id or X-Session-Affinity), wherever it is now:
-        the batch slot that holds it, else the live session.  With parallel requests it takes the control lines like
+        the batch slot that holds it, else the live session, else (the engine looks) the conversation cache, where a
+        later request of another session parked it.  With parallel requests it takes the control lines like
         an admission.  409 when that conversation is no longer held (another took its slot)."""
         if action != "save":
             return error(400, "/slots/session supports action=save")

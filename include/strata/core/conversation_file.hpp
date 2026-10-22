@@ -127,6 +127,8 @@ struct SessionStatus {
     bool published = false;
     // write (POSIX): this filesystem cannot flush a folder (fsync EINVAL); the save succeeded without that flush
     bool dir_flush_unsupported = false;
+    // kv-export: write (streamed K/V): time inside the K/V sources' reads (device -> host) and inside the disk writes
+    double source_ms = 0, disk_ms = 0;
 };
 
 // Progress of a file transfer: (bytes done, bytes in the file).  A write reports once when its temporary file is
@@ -181,6 +183,12 @@ struct SessionKvSource {
 bool session_file_write(const std::string& path, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
                         const SessionFileIdentity& id, size_t& bytes, std::string& error,
                         const SessionWriteOptions& options = {}, SessionStatus* status = nullptr);
+
+// kv-export: a parked conversation (a host image) to a file, keeping only the checkpoint a save keeps
+// (session_deepest_checkpoint) of its chain: the same file a SAVE of it as the live session would write.
+bool session_file_write_parked(const std::string& path, const SavedConversation& image, const SessionFileIdentity& id,
+                               size_t& bytes, std::string& error, const SessionWriteOptions& options = {},
+                               SessionStatus* status = nullptr);
 
 // The checkpoints worth a disk write: the deepest one (the next turn's resume point when the live tail was
 // rewritten).  Earlier checkpoints only serve edits further back and cost ~118 MB each at this geometry.

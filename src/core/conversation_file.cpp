@@ -639,8 +639,14 @@ struct Out {
         count(c);
         if (!f || !ok || !c) return;
         if (hash) hash->update(p, c);
+        const auto t = std::chrono::steady_clock::now();
         ok = f->write(p, c);
+        disk_ms += since(t);
     }
+    static double since(std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+    }
+    double source_ms = 0, disk_ms = 0;   // kv-export: where a streamed write's time goes
     void u64(uint64_t v) { raw(&v, 8); }
     void i64(int64_t v) { raw(&v, 8); }
     template<class T> void vec(const std::vector<T>& v) { u64(v.size()); raw(v.data(), v.size() * sizeof(T)); }
@@ -657,7 +663,10 @@ struct Out {
             size_t room = 0;
             uint8_t* d = f->span(room);
             const size_t c = std::min(room, size - at);
-            if (!s.read || !s.read(part, at, d, c)) {
+            const auto t = std::chrono::steady_clock::now();
+            const bool got = s.read && s.read(part, at, d, c);
+            source_ms += since(t);
+            if (!got) {
                 ok = false;
                 read_failed = true;
                 if (s.error) read_error = s.error();
@@ -665,7 +674,9 @@ struct Out {
             }
             if (hash) hash->update(d, c);
             count(c);
+            const auto t2 = std::chrono::steady_clock::now();
             ok = ok && f->commit(c);
+            disk_ms += since(t2);
             at += c;
         }
     }
@@ -686,12 +697,19 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
     o.u64(c.used);
 }
 
-void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
+void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr,
+                 bool deepest_only = false) {
     for (int64_t g : s.geometry) o.i64(g);
     o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
     put_checkpoint(o, s.live);
-    o.u64(s.checkpoints.size());
-    for (const auto& c : s.checkpoints) put_checkpoint(o, c);
+    if (deepest_only) {   // kv-export: a parked image keeps its chain; the file keeps what a save keeps
+        const ConversationCheckpoint* d = session_deepest_checkpoint(s.checkpoints);
+        o.u64(d ? 1 : 0);
+        if (d) put_checkpoint(o, *d);
+    } else {
+        o.u64(s.checkpoints.size());
+        for (const auto& c : s.checkpoints) put_checkpoint(o, c);
+    }
     if (sources) {
         o.u64(sources->size());
         for (const auto& k : *sources) {
@@ -1035,13 +1053,13 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes) {
 namespace {
 bool write_impl(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
                 const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
-                SessionStatus& st) {
+                SessionStatus& st, bool deepest_only) {
     st = {};
     st.error = SessionError::invalid;   // refusals before any disk access
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
     Out sizing;
-    put_payload(sizing, image, sources);
+    put_payload(sizing, image, sources, deepest_only);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
         sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: the state is too large for this build";
@@ -1084,13 +1102,16 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     Out out;
     out.f = &f;
     out.hash = &hash;
-    if (ok) put_payload(out, image, sources);
+    if (ok) put_payload(out, image, sources, deepest_only);
     ok = ok && out.ok && out.n == payload;
     if (ok) {
         const uint64_t ph = hash.digest();
         ok = f.write(&ph, 8) && f.write(kEnd, 8);
     }
+    const auto tf = std::chrono::steady_clock::now();
     ok = f.finish(opt.durable) && ok;
+    st.source_ms = out.source_ms;
+    st.disk_ms = out.disk_ms + Out::since(tf);
     std::string why;
     if (!ok) {
         why = out.read_failed ? "K/V source read" + (out.read_error.empty() ? std::string() : ": " + out.read_error)
@@ -1111,11 +1132,11 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
 
 bool write_guarded(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
                    const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
-                   SessionStatus* status) {
+                   SessionStatus* status, bool deepest_only = false) {
     SessionStatus st;
     bool ok = false;
     try {
-        ok = write_impl(path, image, sources, id, bytes, error, opt, st);
+        ok = write_impl(path, image, sources, id, bytes, error, opt, st, deepest_only);
     } catch (const std::bad_alloc&) {
         error = "session file: out of memory while writing " + path;
         st.error = SessionError::memory;
@@ -1177,6 +1198,12 @@ bool session_file_write(const std::string& path, const SavedConversation& meta, 
 bool session_file_write(const std::string& path, const SavedConversation& image, const SessionFileIdentity& id,
                         size_t& bytes, std::string& error, const SessionWriteOptions& options, SessionStatus* status) {
     return write_guarded(path, image, nullptr, id, bytes, error, options, status);
+}
+
+bool session_file_write_parked(const std::string& path, const SavedConversation& image, const SessionFileIdentity& id,
+                               size_t& bytes, std::string& error, const SessionWriteOptions& options,
+                               SessionStatus* status) {
+    return write_guarded(path, image, nullptr, id, bytes, error, options, status, true);
 }
 
 namespace {
