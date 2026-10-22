@@ -11398,10 +11398,29 @@ int main(int argc, char** argv) {
             // instead of replacing the live session, so a conversation replicated from another host waits for its
             // next turn without evicting this host's own, and the request path restores it as any parked one
             // (batch slots included).  Answers IMPORTED <tokens> <bytes> <ms>, or SERR as RESTORE does.
-            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0 || line.rfind("IMPORT ", 0) == 0) {
+            // kv-export: SAVEC <slot|-1> <n> <hash> <path> saves one conversation by where it is: batch slot <slot>
+            // (idle, still holding it) or the live session (-1), only if its first <n> tokens hash (FNV-1a 64 over
+            // the int32 ids, 16 hex digits) to <hash> - the server names the conversation by the prompt it sent, so
+            // a slot another conversation took meanwhile is refused instead of saved under the wrong name.
+            const bool savec = line.rfind("SAVEC ", 0) == 0;
+            if (line.rfind("SAVE ", 0) == 0 || savec || line.rfind("RESTORE ", 0) == 0 || line.rfind("IMPORT ", 0) == 0) {
                 const bool save = line[0] == 'S';
                 const bool import = line[0] == 'I';
-                const std::string path = line.substr(save ? 5 : import ? 7 : 8);
+                long long savec_slot = -1, savec_n = 0;
+                unsigned long long savec_hash = 0;
+                std::string path;
+                if (savec) {
+                    int used = 0;
+                    if (std::sscanf(line.c_str() + 6, "%lld %lld %llx %n", &savec_slot, &savec_n, &savec_hash, &used) != 3 ||
+                        used <= 0) {
+                        std::printf("SERR invalid 0 expected: SAVEC <slot|-1> <n> <hash> <path>\n");
+                        std::fflush(stdout);
+                        continue;
+                    }
+                    path = line.substr(6 + (size_t) used);
+                } else {
+                    path = line.substr(save ? 5 : import ? 7 : 8);
+                }
                 const auto t0 = Clock::now();
                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
@@ -11433,7 +11452,7 @@ int main(int argc, char** argv) {
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
-                if (o.batch > 0 && !import) { refuse("session files do not support --batch (parallel requests)"); continue; }
+                if (o.batch > 0 && !import && !savec) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (import && !conversations.enabled()) {
                     refuse("IMPORT parks the conversation: it needs --conversation-cache-mib > 0");
                     continue;
@@ -11457,7 +11476,42 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 if (save) {
-                    if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
+                    // what is saved: the live session, or (SAVEC) an idle batch slot's
+                    const std::vector<int32_t>* src_ids = &live;
+                    static const std::vector<ImgKey> no_imgs;
+                    const std::vector<ImgKey>* src_imgs = &live_imgs;
+                    const std::vector<ConvCheckpoint>* src_checks = &checks;
+                    bool src_cvec = cvec_cached, src_ok = live_ok;
+                    strata::core::SessionState* src_ss = &ss;
+                    const strata::core::QsaState* src_draft = &mtp.kv_state();
+                    if (savec && savec_slot >= 0) {
+                        if (savec_slot >= (long long) bs.size()) { refuse("no such batch slot"); continue; }
+                        if (!stages.empty()) { refuse("SAVEC of a batch slot does not support --layer-split"); continue; }
+                        const BSlot& sl = bs[(size_t) savec_slot];
+                        if (sl.active) { refuse("the batch slot is decoding"); continue; }
+                        if (!sl.cached || sl.partial || sl.tainted) { refuse("the batch slot holds no complete conversation"); continue; }
+                        if (sl.img) { refuse("the batch slot's conversation has pictures"); continue; }
+                        src_ids = &sl.ids;
+                        src_imgs = &no_imgs;
+                        src_checks = &sl.checks;
+                        src_cvec = sl.cvec;
+                        src_ok = true;
+                        src_ss = bslot_ss[0][(size_t) savec_slot].get();
+                        // the slot's own drafter with --batch-mtp; else the solo drafter's K/V, which was built for
+                        // another conversation: it only proposes drafts (the verifier decides), as when a slot goes
+                        // back to the solo path
+                        if (batch_mtp && (size_t) savec_slot < slot_mtp.size()) src_draft = &slot_mtp[(size_t) savec_slot]->kv_state();
+                    }
+                    if (savec) {
+                        uint64_t h = 1469598103934665603ULL;
+                        const bool fits = savec_n > 0 && (size_t) savec_n <= src_ids->size();
+                        for (long long i = 0; fits && i < savec_n; ++i) {
+                            const uint32_t v = (uint32_t) (*src_ids)[(size_t) i];
+                            for (int k = 0; k < 4; ++k) { h ^= (v >> (8 * k)) & 0xff; h *= 1099511628211ULL; }
+                        }
+                        if (!fits || h != savec_hash) { refuse("that conversation is no longer held there"); continue; }
+                    }
+                    if (!src_ok || src_ids->empty()) { refuse("no complete session to save"); continue; }
                     size_t bytes = 0, kept = 0;
                     double capture_ms = 0;
                     try {
@@ -11472,18 +11526,18 @@ int main(int argc, char** argv) {
                             strata::core::ConversationStateSizes z;
                             std::string why;
                             uint64_t state = UINT64_MAX;   // unknown sizes: the preflight refuses rather than guesses
-                            if (strata::core::conversation_session_sizes(g, ss, z, why)) {
-                                const uint64_t q = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0);
+                            if (strata::core::conversation_session_sizes(g, *src_ss, z, why)) {
+                                const uint64_t q = (uint64_t) std::max<int64_t>(src_ss->qsa_alloc, 0);
                                 const uint64_t per = (uint64_t) z.tail + z.dead + z.block_pos;
                                 if (q == 0 || per <= (UINT64_MAX - z.gdn - z.ple) / q) state = z.gdn + z.ple + q * per;
                             }
                             sl.state_bytes = state;
-                            sl.tokens = live.size();
-                            sl.images = live_imgs.size();
-                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
+                            sl.tokens = src_ids->size();
+                            sl.images = src_imgs->size();
+                            sl.kv_layers = (uint64_t) std::max<int64_t>(src_ss->qsa_alloc, 0) + 1;
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
-                        if (o.session_save_reclaim) {
+                        if (o.session_save_reclaim && src_ss == &ss) {
                             const auto freed = strata::core::session_save_reclaim(
                                 checks, conversations, sl, floor, strata::core::available_host_bytes);
                             if (freed.bytes || freed.checkpoints || freed.parked) {
@@ -11508,17 +11562,17 @@ int main(int argc, char** argv) {
                         };
                         std::vector<ConvCheckpoint> disk_checks;
                         std::string why;
-                        if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why)) {
+                        if (!strata::core::session_save_checkpoints(*src_checks, sl, admit, disk_checks, why)) {
                             refuse(why, strata::core::SessionError::memory);
                             continue;
                         }
                         kept = disk_checks.size();
-                        const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
+                        const strata::core::ConversationView view{*src_ids, *src_imgs, disk_checks, src_cvec};
                         strata::core::SavedConversation meta;
                         std::vector<strata::core::SessionKvSource> sources;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
+                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, *src_ss, g, *src_draft,
                                                                          err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -11541,9 +11595,9 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
-                                 "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
+                                 "in %.1f ms (state %.1f ms)\n", src_ids->size(), kept, src_checks->size(), bytes,
                                  path.c_str(), ms(), capture_ms);
-                    std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
+                    std::printf("SAVED %zu %zu %.1f\n", src_ids->size(), bytes, ms());
                 } else {
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
