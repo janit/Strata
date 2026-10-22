@@ -85,15 +85,52 @@ different files (one token more, K/V that differs from about cell 49,152). Compa
 across processes by their answers, not their bytes.
 
 On teddy (a 97% full NVMe, 1.2–1.3 GB/s direct writes) a save is now disk-bound: hashing on the
-writer thread instead was no faster, and on a faster disk it would be slower. To go below 0.5 s
-per GB, write fewer bytes:
+writer thread instead was no faster, and on a faster disk it would be slower. Writing fewer bytes is the incremental save below.
 
-- **Incremental save:** the running state plus the K/V from the first changed page. Either keep a
-  page hash list per save and compare by content (safe; costs a full K/V read, 65–120 ms), or track
-  the first rewritten cell per source (faster; every K/V writer must be covered, or a valid-looking
-  file has stale contents).
-- **No file at all:** stream the save to the replicating process, which sends only what the
-  receiver lacks. That needs a stream target instead of `Publisher`'s temporary file and rename.
+## Incremental saves
+
+```
+POST /slots/session?action=save {"session", "filename", "base": "<save_id of an earlier save>"}   (base optional)
+-> 200 {..., "save_id": "<16 hex>", "base": "<16 hex>" | null, "delta": true | false}
+```
+
+Every save by session has a `save_id` (engine command `SAVEX`, answer `SAVEDX`). Given the id
+of an earlier save of the same conversation that the engine still remembers (its last 64 saves,
+per process), it writes a **delta file** instead of a session file. A delta keeps the bytes of the
+cells before the first token that differs from the base's tokens: whole pages, whole indexer rows,
+the draft one cell less, rounded down to whole 256 KiB chunks. Strata's own retained-K/V reuse
+keeps cells by the same rule. A conversation with pictures, a different control vector or another
+K/V layout saves in full. `"delta": false` means a full session file (no base, an unknown base, or
+nothing to keep).
+
+**STRSDLT v1** (little-endian):
+
+- **Header, 80 bytes:** `STRSDLT\x01`, u32 version 1, u32 header size 80, u64 model fingerprint,
+  u64 config fingerprint, u64 payload length (the bytes between header and trailer), u64 base
+  save_id, u64 new save_id, u64 size of the session file it rebuilds, u64 reserved 0, u64
+  `session_hash64(first 72 bytes, 0)`.
+- **Payload:** the STRSESS payload in order. Each K/V buffer's u64 size is followed by u64 keep (a
+  multiple of 262144), then the bytes from keep on, then u64 n = ceil(size / 262144) and n chunk
+  hashes. Chunk hash i is `session_hash64` (seed 0) of bytes [i*262144, min(size, (i+1)*262144))
+  of the whole new part.
+- **Trailer:** u64 `session_hash64(payload, 0)`, then `STRSDEND`.
+
+Rebuild: the session file's header for the new payload length, the payload with each K/V buffer as
+u64 size, the base part's first keep bytes and the delta's tail, then the trailer (the payload's
+`session_hash64` and `STRSEND\x01`). Check every chunk hash against the rebuilt part.
+`rebuild()` in `src/core/conversation_file_test.cpp` is the reference.
+
+What the chunk hashes protect is the receiver's copy (damage at rest, a wrong apply). Kept chunks
+carry the base's hashes, so they cannot catch a keep that went past a real change: that is the
+engine's rule above. It is checked on real saves. In one process, base + delta rebuilt the device's
+own full save of the same state byte for byte on all three paths: the live session, a parallel
+batch backend and a parked conversation.
+
+| 50k-token turn, RTX A4000 | full save | delta |
+|---|---|---|
+| live session | 1.0 GB, 0.71 s | 244 MB, 0.30 s |
+| batch backend (parallel 2) | 1.0 GB, 0.63 s | 244 MB, 0.26 s |
+| parked conversation | 1.0 GB, 0.64 s | 244 MB, 0.19 s |
 
 ## Server memory
 
@@ -110,5 +147,9 @@ ms per 50k tokens), not while holding them.
 - `src/core/conversation_file_test.cpp`: `session_ids_fnv1a64` against the same vector; a parked
   image's file equals the file of the image holding only its deepest checkpoint; write-behind and
   in-place writes are byte-identical; checkpoints by reference equal checkpoints copied into the
-  image. It also runs under ThreadSanitizer, except the address-space limit test, which
+  image; delta saves (base + delta rebuild the full file byte for byte, also for a parked image;
+  a damaged base or delta is caught; a keep that is not whole chunks of the part and the base is
+  refused). It also runs under ThreadSanitizer, except the address-space limit test, which
   ThreadSanitizer cannot run.
+- `serve/test_kv_export.py` also covers the base field: a delta answer, an unknown base, malformed
+  ids, and an answer out of step, which ends the engine.
