@@ -851,6 +851,15 @@ uint64_t SessionHasher::digest() const {
     return h;
 }
 
+uint64_t session_ids_fnv1a64(const int32_t* ids, size_t n) {
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t v = (uint32_t) ids[i];
+        for (int k = 0; k < 4; ++k) { h ^= (v >> (8 * k)) & 0xff; h *= 1099511628211ULL; }
+    }
+    return h;
+}
+
 uint64_t session_hash64(const void* data, size_t n, uint64_t seed) {
     SessionHasher h(seed);
     h.update(data, n);

@@ -11503,17 +11503,12 @@ int main(int argc, char** argv) {
                         if (batch_mtp && (size_t) savec_slot < slot_mtp.size()) src_draft = &slot_mtp[(size_t) savec_slot]->kv_state();
                     }
                     if (savec) {
-                        uint64_t h = 14695981039346656037ULL;
                         const bool fits = savec_n > 0 && (size_t) savec_n <= src_ids->size();
-                        for (long long i = 0; fits && i < savec_n; ++i) {
-                            const uint32_t v = (uint32_t) (*src_ids)[(size_t) i];
-                            for (int k = 0; k < 4; ++k) { h ^= (v >> (8 * k)) & 0xff; h *= 1099511628211ULL; }
-                        }
-                        if (!fits || h != savec_hash) { refuse("that conversation is no longer held there"); continue; }
+                        if (!fits || strata::core::session_ids_fnv1a64(src_ids->data(), (size_t) savec_n) != savec_hash) { refuse("that conversation is no longer held there"); continue; }
                     }
                     if (!src_ok || src_ids->empty()) { refuse("no complete session to save"); continue; }
                     size_t bytes = 0, kept = 0;
-                    double capture_ms = 0;
+                    double capture_ms = 0, checks_ms = 0;   // kv-export: where a save's pause goes
                     try {
                         // RAM PREFLIGHT for the save (not a reservation), BEFORE anything is copied: the deepest
                         // checkpoint is chosen by reference, and the copies it will take (the list below and the one
@@ -11567,6 +11562,7 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         kept = disk_checks.size();
+                        checks_ms = ms();
                         const strata::core::ConversationView view{*src_ids, *src_imgs, disk_checks, src_cvec};
                         strata::core::SavedConversation meta;
                         std::vector<strata::core::SessionKvSource> sources;
@@ -11594,9 +11590,11 @@ int main(int argc, char** argv) {
                         refuse("not enough RAM to save the session", strata::core::SessionError::memory);
                         continue;
                     }
+                    const double total_ms = ms();
                     std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
-                                 "in %.1f ms (state %.1f ms)\n", src_ids->size(), kept, src_checks->size(), bytes,
-                                 path.c_str(), ms(), capture_ms);
+                                 "in %.1f ms (state %.1f ms: checkpoints %.1f, live %.1f; write %.1f ms)\n",
+                                 src_ids->size(), kept, src_checks->size(), bytes, path.c_str(), total_ms, capture_ms,
+                                 checks_ms, capture_ms - checks_ms, total_ms - capture_ms);
                     std::printf("SAVED %zu %zu %.1f\n", src_ids->size(), bytes, ms());
                 } else {
                     strata::core::SavedConversation image;

@@ -766,7 +766,8 @@ KV_SESSIONS_KEPT = 1024
 
 def kv_session_id(headers) -> str | None:
     # the order viiwork routes by (internal/proxy sessionKey): X-Session-Affinity, then X-Session-Id
-    sid = (headers.get("X-Session-Affinity") or headers.get("X-Session-Id") or "").strip()
+    # (the first non-empty one as it stands, like viiwork; one with spaces or controls names no session)
+    sid = headers.get("X-Session-Affinity") or headers.get("X-Session-Id") or ""
     return sid[:256] if sid and all(32 < ord(c) < 127 for c in sid) else None
 
 
@@ -3241,6 +3242,8 @@ class Service:
             return error(501, "slot save/restore is disabled (start the server with --slot-save-path DIR)")
         if slot == "session":
             return self.session_save(action, filename, session, error)
+        if getattr(self.engine, "batch", 0) and action == "import" and slot == "0":
+            return self.session_import_batch(filename, error)
         if getattr(self.engine, "batch", 0):
             # #465 parallel requests do not hold the FIFO and share the engine's control lines: a session file
             # could interleave with a request being admitted, so the two are not combined (the engine refuses too)
@@ -3330,15 +3333,7 @@ class Service:
                         h = eng.slot_held[b]
                         if not eng.slot_busy[b] and len(h) >= len(ids) and len(h) > held and h[:len(ids)] == ids:
                             where, held = b, len(h)
-                cancel = threading.Event()
-                for _ in eng._take_control(cancel, 0):     # heartbeats while an admission holds the lines
-                    pass
-                try:
-                    r = eng.session_file("save", path, (where, ids))
-                finally:
-                    eng.ctl.release()
-                    with eng.slot_cv:
-                        eng.slot_cv.notify_all()
+                r = self.with_control(lambda: eng.session_file("save", path, (where, ids)))
             else:
                 where = -1
                 with self.fifo:
@@ -3352,6 +3347,55 @@ class Service:
             return error(400, str(e))
         return 200, {"id_slot": where, "session": session, "filename": filename, "n_saved": r["tokens"],
                      "n_written": r["bytes"], "timings": {"save_ms": r["ms"]}}
+
+    def kv_note(self, sid, ids) -> None:
+        """kv-export: the conversation client session `sid` continues starts with these ids (the last
+        KV_SESSIONS_KEPT sessions), for POST /slots/session?action=save."""
+        if not sid:
+            return
+        with self.status_lock:
+            kept = self.__dict__.setdefault("kv_sessions", collections.OrderedDict())
+            kept[sid] = list(ids)
+            kept.move_to_end(sid)
+            while len(kept) > KV_SESSIONS_KEPT:
+                kept.popitem(last=False)
+
+    def with_control(self, fn):
+        """kv-export: fn() while holding the engine's control lines, as an admission does (parallel requests only):
+        a session command between two admissions, never inside one.  The slots keep decoding meanwhile."""
+        eng = self.engine
+        for _ in eng._take_control(threading.Event(), 0):  # heartbeats while an admission holds the lines
+            pass
+        try:
+            return fn()
+        finally:
+            eng.ctl.release()
+            with eng.slot_cv:
+                eng.slot_cv.notify_all()
+
+    def session_import_batch(self, filename, error) -> tuple[int, dict]:
+        """kv-export: POST /slots/0?action=import with parallel requests: the engine parks the file (it never touches
+        the live session or a slot), so it only needs the control lines, not the FIFO."""
+        why = slot_filename_problem(filename)
+        if why:
+            return error(400, f"filename {why}")
+        path = os.path.join(self.slot_save_path, filename)
+        try:
+            os.lstat(path)                                  # the engine opens it without following a link
+        except OSError:
+            return error(404, f"no saved session named {filename}")
+        if not self.loaded():
+            return error(503, "the model is not loaded")
+        try:
+            r = self.with_control(lambda: self.engine.session_file("import", path))
+        except SessionRefused as e:
+            body = error(e.status, str(e))
+            body[1]["error"]["kind"] = e.kind
+            return body
+        except ValueError as e:
+            return error(400, str(e))
+        return 200, {"id_slot": 0, "filename": filename, "n_imported": r["tokens"], "n_read": r["bytes"],
+                     "timings": {"import_ms": r["ms"]}}
 
     def set_aliases(self, aliases) -> None:
         """#297: the config's `aliases` - a list of names (or one comma-separated string), like llama-server's --alias.
@@ -4270,14 +4314,7 @@ class Service:
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
-        sid = getattr(KV_SESSION, "sid", None)
-        if sid:                         # kv-export: the conversation this session continues starts with these ids
-            with self.status_lock:
-                kept = self.__dict__.setdefault("kv_sessions", collections.OrderedDict())
-                kept[sid] = list(ids)
-                kept.move_to_end(sid)
-                while len(kept) > KV_SESSIONS_KEPT:
-                    kept.popitem(last=False)
+        self.kv_note(getattr(KV_SESSION, "sid", None), ids)
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
         defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}

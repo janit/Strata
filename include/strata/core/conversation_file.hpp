@@ -41,6 +41,9 @@ private:
     uint64_t total_ = 0;
 };
 uint64_t session_hash64(const void* data, size_t n, uint64_t seed);
+// kv-export: FNV-1a 64 over token ids as little-endian int32 - how SAVEC and the server (serve/server.py
+// fnv1a64_ids) name a conversation by its prompt.  {0, 1, -1, 151643} -> 0x2401b33d3e943579.
+uint64_t session_ids_fnv1a64(const int32_t* ids, size_t n);
 
 // Typed, length-delimited fields for an identity hash: each field is (tag, type, length, bytes), so two different
 // field lists never give the same byte stream, and a double is hashed by its exact bits (no decimal rounding).

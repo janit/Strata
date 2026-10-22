@@ -151,6 +151,11 @@ bool rejects(const fs::path& p, const SessionFileIdentity& id, const char* expec
 } // namespace
 
 int main() {
+    {   // kv-export: the conversation name SAVEC checks; the same vector is pinned in serve/test_kv_export.py
+        const int32_t ids[] = {0, 1, -1, 151643};
+        check(session_ids_fnv1a64(ids, 4) == 0x2401b33d3e943579ULL, "SAVEC ids hash matches the server's");
+        check(session_ids_fnv1a64(ids, 0) == 14695981039346656037ULL, "SAVEC ids hash of nothing is the basis");
+    }
     const fs::path dir = fs::temp_directory_path() / ("strata-session-test-" + std::to_string(
         std::chrono::steady_clock::now().time_since_epoch().count()));
     fs::create_directories(dir);
