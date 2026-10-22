@@ -60,7 +60,7 @@ save/restore. Upstream's `/slots/0?action=save|restore` still refuse parallel re
 | session file | 1.0 GB (about 20 KiB per token) |
 | save | 0.56 s, blocking every slot of the engine (ext4; tmpfs is slower). It was 0.80 s before the two changes below |
 | save, split | live state off the device 80–90 ms; K/V off the device 65–120 ms; payload hash 170 ms; disk the rest |
-| import | 0.92–1.5 s, holding the engine |
+| import | 0.64 s (about 1.1 s for the first imports into a process, which allocate fresh RAM); the reader reads the next block on a thread while it parses the current one |
 | next turn after import | 0.8–2.0 s, against 41 s cold; output identical to the original host |
 
 Consecutive turns' files differ in 240 MB of 1.0 GB. The K/V is byte-identical up to the reuse
@@ -94,6 +94,13 @@ per GB, write fewer bytes:
   file has stale contents).
 - **No file at all:** stream the save to the replicating process, which sends only what the
   receiver lacks. That needs a stream target instead of `Publisher`'s temporary file and rename.
+
+## Server memory
+
+The server remembers the prompt of each session's last request so that it can find the
+conversation again. It keeps the last 1024 sessions, packed as int32 (4 bytes a token), with at
+most 64 MiB in total; the oldest go first. It hashes a prompt before taking the control lines (36
+ms per 50k tokens), not while holding them.
 
 ## Tests
 
