@@ -11503,7 +11503,7 @@ int main(int argc, char** argv) {
                         if (batch_mtp && (size_t) savec_slot < slot_mtp.size()) src_draft = &slot_mtp[(size_t) savec_slot]->kv_state();
                     }
                     if (savec) {
-                        uint64_t h = 1469598103934665603ULL;
+                        uint64_t h = 14695981039346656037ULL;
                         const bool fits = savec_n > 0 && (size_t) savec_n <= src_ids->size();
                         for (long long i = 0; fits && i < savec_n; ++i) {
                             const uint32_t v = (uint32_t) (*src_ids)[(size_t) i];
