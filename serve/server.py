@@ -2108,16 +2108,16 @@ class StrataEngine:
         a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
         explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
         that never ends is still ended."""
-        if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
+        if action not in ("save", "restore", "import") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+            self.proc.stdin.write(f"{action.upper()} {path}\n")
             self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
-        want = "SAVED" if action == "save" else "RESTORED"
+        want = {"save": "SAVED", "restore": "RESTORED", "import": "IMPORTED"}[action]
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
@@ -3217,13 +3217,13 @@ class Service:
             return error(501, "slot save/restore is not available with parallel requests (\"parallel\" / --batch)")
         if slot != "0":
             return error(400, "this server has one slot: 0")
-        if action not in ("save", "restore"):
-            return error(400, "action must be save or restore")
+        if action not in ("save", "restore", "import"):
+            return error(400, "action must be save, restore or import")
         why = slot_filename_problem(filename)
         if why:
             return error(400, f"filename {why}")
         path = os.path.join(self.slot_save_path, filename)
-        if action == "restore":
+        if action in ("restore", "import"):
             try:
                 os.lstat(path)                              # the engine opens it without following a link
             except OSError:
@@ -3240,8 +3240,8 @@ class Service:
                 if not self.loaded():
                     return error(503, "the model is not loaded")
                 with self.status_lock:
-                    self.status.update(busy=True, phase="saving the session" if action == "save"
-                                       else "restoring a session", started=time.time(), first_token=None,
+                    self.status.update(busy=True, phase={"save": "saving the session", "restore": "restoring a session",
+                                       "import": "importing a session"}[action], started=time.time(), first_token=None,
                                        prompt_tokens=None, generated=None, max_tokens=None)
                 try:
                     if action == 'save' and getattr(self.engine, 'session_save_reclaim', False):
@@ -3268,6 +3268,9 @@ class Service:
         if action == "save":
             return 200, {"id_slot": 0, "filename": filename, "n_saved": r["tokens"], "n_written": r["bytes"],
                          "timings": {"save_ms": r["ms"]}}
+        if action == "import":
+            return 200, {"id_slot": 0, "filename": filename, "n_imported": r["tokens"], "n_read": r["bytes"],
+                         "timings": {"import_ms": r["ms"]}}
         return 200, {"id_slot": 0, "filename": filename, "n_restored": r["tokens"], "n_read": r["bytes"],
                      "timings": {"restore_ms": r["ms"]}}
 

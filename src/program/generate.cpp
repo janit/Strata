@@ -11394,14 +11394,19 @@ int main(int argc, char** argv) {
             // (fingerprint file, state capture, file flush, rename + folder flush, validation, device transfer):
             // that step is allowed <seconds> (session_phase_limit_s) by the watchdog and by the server, no more.
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
-            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
+            // kv-export: IMPORT <path> reads a session file like RESTORE but parks it in the conversation cache
+            // instead of replacing the live session, so a conversation replicated from another host waits for its
+            // next turn without evicting this host's own, and the request path restores it as any parked one
+            // (batch slots included).  Answers IMPORTED <tokens> <bytes> <ms>, or SERR as RESTORE does.
+            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0 || line.rfind("IMPORT ", 0) == 0) {
                 const bool save = line[0] == 'S';
-                const std::string path = line.substr(save ? 5 : 8);
+                const bool import = line[0] == 'I';
+                const std::string path = line.substr(save ? 5 : import ? 7 : 8);
                 const auto t0 = Clock::now();
                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
                                   bool published = false) {
-                    std::fprintf(stderr, "strata serve: session %s %s: %s\n", save ? "save" : "restore", path.c_str(),
+                    std::fprintf(stderr, "strata serve: session %s %s: %s\n", save ? "save" : import ? "import" : "restore", path.c_str(),
                                  why.c_str());
                     std::string one = why;   // one protocol line
                     for (char& c : one) if (c == '\n' || c == '\r') c = ' ';
@@ -11428,7 +11433,11 @@ int main(int argc, char** argv) {
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
-                if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
+                if (o.batch > 0 && !import) { refuse("session files do not support --batch (parallel requests)"); continue; }
+                if (import && !conversations.enabled()) {
+                    refuse("IMPORT parks the conversation: it needs --conversation-cache-mib > 0");
+                    continue;
+                }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
@@ -11574,6 +11583,26 @@ int main(int argc, char** argv) {
                     blocking("validate", bytes);
                     if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
                         refuse(err);
+                        continue;
+                    }
+                    if (import) {
+                        // host memory only: the device state, the live session and the batch slots are untouched
+                        const size_t tokens = image.live.ids.size(), held = image.bytes();
+                        if (!conversations.wants((int64_t) tokens)) {
+                            refuse("shorter than --conversation-cache-min-tokens");
+                            continue;
+                        }
+                        if (!conversations.put(std::move(image))) {
+                            refuse("no room in the conversation cache (--conversation-cache-mib / -slots)",
+                                   strata::core::SessionError::memory);
+                            continue;
+                        }
+                        std::fprintf(stderr, "strata serve: session imported %zu tokens, %zu bytes (%zu in RAM) from %s "
+                                     "in %.1f ms (read+check %.1f ms); parked=%zu bytes=%zu evictions=%zu\n", tokens,
+                                     bytes, held, path.c_str(), ms(), read_ms, conversations.size(),
+                                     conversations.bytes(), conversations.evictions());
+                        std::printf("IMPORTED %zu %zu %.1f\n", tokens, bytes, ms());
+                        std::fflush(stdout);
                         continue;
                     }
                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
