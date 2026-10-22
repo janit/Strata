@@ -38,10 +38,11 @@ class FakeProc:
         e = self.engine
         if e.refuse:
             e.lines.put(f"SERR invalid 0 {e.refuse}\n")
-        elif cmd == "SAVEC":
-            slot, n, h, path = rest.split(" ", 3)
+        elif cmd == "SAVEX":
+            slot, n, h, base, path = rest.split(" ", 4)
             Path(path).write_bytes(b"s" * 100)
-            e.lines.put(f"SAVED {n} 100 12.5\n")
+            # the engine knows base 00000000000000aa only: a delta against it, else a full save
+            e.lines.put(f"SAVEDX {n} 100 12.5 {e.next_id} {base if base == '00000000000000aa' else '0' * 16}\n")
         elif cmd == "IMPORT":
             e.lines.put("IMPORTED 50000 1000 1500.0\n")
         elif cmd == "SAVE":
@@ -62,6 +63,7 @@ class FakeEngine(StrataEngine):
         self.ended = False
         self.lines = queue.Queue()
         self.refuse = None
+        self.next_id = "00000000000000bb"
         self.silence_s = 30.0
         self.proc = FakeProc(self)
         self.solo()
@@ -172,7 +174,37 @@ class KvExport(unittest.TestCase):
         self.assertEqual(body["id_slot"], -1)
         self.assertEqual(body["n_saved"], 3)
         path = str(Path(self.dir.name) / "s1.bin")
-        self.assertEqual(self.engine.proc.sent, [f"SAVEC -1 3 {fnv1a64_ids([5, 6, 7]):016x} {path}"])
+        self.assertEqual(self.engine.proc.sent, [f"SAVEX -1 3 {fnv1a64_ids([5, 6, 7]):016x} {0:016x} {path}"])
+        self.assertEqual((body["save_id"], body["base"], body["delta"]), ("00000000000000bb", None, False))
+
+    def test_save_against_a_base(self):
+        self.svc.kv_note("s1", [5, 6, 7])
+        code, body = self.post("/slots/session?action=save", {"session": "s1", "filename": "d.bin",
+                                                              "base": "00000000000000aa"})
+        self.assertEqual(code, 200, body)
+        self.assertEqual((body["save_id"], body["base"], body["delta"]), ("00000000000000bb", "00000000000000aa", True))
+        self.assertIn(" 00000000000000aa ", self.engine.proc.sent[0])
+        code, body = self.post("/slots/session?action=save", {"session": "s1", "filename": "d.bin",
+                                                              "base": "00000000000000cc"})
+        self.assertEqual((code, body["base"], body["delta"]), (200, None, False))   # unknown base: a full save
+        for bad in ("AA", "00000000000000AA", 5, "0x00000000000000"):
+            code, _ = self.post("/slots/session?action=save", {"session": "s1", "filename": "d.bin", "base": bad})
+            self.assertEqual(code, 400, bad)
+
+    def test_an_answer_out_of_step_ends_the_engine(self):
+        self.svc.kv_note("s1", [1])
+        orig = FakeProc.write
+        def bad(proc, s):
+            proc.sent.append(s.strip())
+            proc.engine.lines.put("SAVEDX 1 100 12.5 nothex!!nothex!! 0000000000000000\n")
+        FakeProc.write = bad
+        try:
+            code, _ = self.save()
+        finally:
+            FakeProc.write = orig
+        self.assertEqual(code, 500)
+        self.assertTrue(self.engine.ended)
+        self.engine.ended = False
 
     def test_unknown_session_is_404_and_reaches_no_engine(self):
         code, _ = self.save("nobody")
@@ -215,7 +247,7 @@ class KvExport(unittest.TestCase):
         code, body = self.save()
         self.assertEqual(code, 200, body)
         self.assertEqual(body["id_slot"], 1)
-        self.assertTrue(e.proc.sent[0].startswith(f"SAVEC 1 3 {fnv1a64_ids(ids):016x} "))
+        self.assertTrue(e.proc.sent[0].startswith(f"SAVEX 1 3 {fnv1a64_ids(ids):016x} {0:016x} "))
         self.assertFalse(e.ctl.locked(), "the control lines are given back")
         self.assertEqual(e.ctl_epoch, 1)
 

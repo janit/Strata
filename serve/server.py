@@ -2124,7 +2124,7 @@ class StrataEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
-    def session_file(self, action: str, path: str, conv: tuple[int, int, int] | None = None) -> dict:
+    def session_file(self, action: str, path: str, conv: tuple | None = None) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
@@ -2143,8 +2143,14 @@ class StrataEngine:
         # kv-export: `conv` = (where, n, hash): SAVEC saves the conversation whose first n ids hash to `hash`
         # (fnv1a64_ids) from batch slot `where` (or the live session, -1, else a parked one), and the engine refuses
         # if it is no longer held there
-        cmd = f"{action.upper()} {path}\n" if conv is None else \
-            f"SAVEC {int(conv[0])} {int(conv[1])} {int(conv[2]):016x} {path}\n"
+        # (where, n, hash, base): SAVEX - the same, remembered by the engine, and a delta file against the earlier
+        # SAVEX `base` (0: none) when it can; the answer adds "save_id" and "base" (None: a full session file)
+        if conv is None:
+            cmd = f"{action.upper()} {path}\n"
+        elif len(conv) == 4:
+            cmd = f"SAVEX {int(conv[0])} {int(conv[1])} {int(conv[2]):016x} {int(conv[3]):016x} {path}\n"
+        else:
+            cmd = f"SAVEC {int(conv[0])} {int(conv[1])} {int(conv[2]):016x} {path}\n"
         try:
             with getattr(self, "wlock", None) or contextlib.nullcontext():
                 self.proc.stdin.write(cmd)
@@ -2154,6 +2160,8 @@ class StrataEngine:
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
         want = {"save": "SAVED", "restore": "RESTORED", "import": "IMPORTED"}[action]
+        if conv is not None and len(conv) == 4:
+            want = "SAVEDX"
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
@@ -2218,14 +2226,19 @@ class StrataEngine:
                 raise SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
             if head == want:
                 try:
-                    if len(f) != 4:
+                    if len(f) != (6 if want == "SAVEDX" else 4):
                         raise ValueError
                     tokens, size, ms = count(f[1]), count(f[2]), float(f[3])
                     if not math.isfinite(ms) or ms < 0:
                         raise ValueError
+                    out = {"tokens": tokens, "bytes": size, "ms": ms}
+                    if want == "SAVEDX":
+                        if not all(len(x) == 16 and all(c in "0123456789abcdef" for c in x) for x in f[4:6]):
+                            raise ValueError
+                        out["save_id"], out["base"] = f[4], (f[5] if int(f[5], 16) else None)
                 except ValueError:
                     raise out_of_step(line) from None
-                return {"tokens": tokens, "bytes": size, "ms": ms}
+                return out
             if head == "INFO" or head == "WARN":          # engine log lines may interleave; they are not answers
                 heard = time.monotonic()
                 continue
@@ -3239,7 +3252,7 @@ class Service:
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
 
-    def slot_action(self, slot: str, action: str, filename, session=None) -> tuple[int, dict]:
+    def slot_action(self, slot: str, action: str, filename, session=None, base=None) -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
         to or from a file in slot_save_path.  -> (HTTP status, body)."""
         def error(code, message):
@@ -3248,7 +3261,7 @@ class Service:
         if not self.slot_save_path or not hasattr(self.engine, "session_file"):
             return error(501, "slot save/restore is disabled (start the server with --slot-save-path DIR)")
         if slot == "session":
-            return self.session_save(action, filename, session, error)
+            return self.session_save(action, filename, session, error, base)
         if getattr(self.engine, "batch", 0) and action == "import" and slot == "0":
             return self.session_import_batch(filename, error)
         if getattr(self.engine, "batch", 0):
@@ -3314,7 +3327,7 @@ class Service:
         return 200, {"id_slot": 0, "filename": filename, "n_restored": r["tokens"], "n_read": r["bytes"],
                      "timings": {"restore_ms": r["ms"]}}
 
-    def session_save(self, action, filename, session, error) -> tuple[int, dict]:
+    def session_save(self, action, filename, session, error, base=None) -> tuple[int, dict]:
         """kv-export: POST /slots/session?action=save {"session": ID, "filename": NAME} saves the conversation the
         client session ID last continued (its requests carried X-Session-Id or X-Session-Affinity), wherever it is now:
         the batch slot that holds it, else the live session, else (the engine looks) the conversation cache, where a
@@ -3329,6 +3342,10 @@ class Service:
             ids = (self.__dict__.get("kv_sessions") or {}).get(session) if isinstance(session, str) else None
         if not ids:
             return error(404, "no request of that session on this server")
+        if base is not None and not (isinstance(base, str) and len(base) == 16 and
+                                     all(c in "0123456789abcdef" for c in base)):
+            return error(400, "base must be a save_id: 16 lowercase hex digits")
+        base_id = int(base, 16) if base else 0
         path = os.path.join(self.slot_save_path, filename)
         eng = self.engine
         if not self.loaded():
@@ -3343,11 +3360,11 @@ class Service:
                         if (not eng.slot_busy[b] and len(h) >= len(ids) and len(h) > held and
                                 array.array("i", h[:len(ids)]) == ids):
                             where, held = b, len(h)
-                r = self.with_control(lambda: eng.session_file("save", path, (where, len(ids), name)))
+                r = self.with_control(lambda: eng.session_file("save", path, (where, len(ids), name, base_id)))
             else:
                 where = -1
                 with self.fifo:
-                    r = eng.session_file("save", path, (where, len(ids), name))
+                    r = eng.session_file("save", path, (where, len(ids), name, base_id))
         except SessionRefused as e:
             code = 409 if "no longer held" in str(e) or "decoding" in str(e) else e.status
             body = error(code, str(e))
@@ -3356,7 +3373,8 @@ class Service:
         except ValueError as e:
             return error(400, str(e))
         return 200, {"id_slot": where, "session": session, "filename": filename, "n_saved": r["tokens"],
-                     "n_written": r["bytes"], "timings": {"save_ms": r["ms"]}}
+                     "n_written": r["bytes"], "timings": {"save_ms": r["ms"]}, "save_id": r["save_id"],
+                     "base": r["base"], "delta": r["base"] is not None}
 
     def kv_note(self, sid, ids) -> None:
         """kv-export: the conversation client session `sid` continues starts with these ids (the last
@@ -5776,7 +5794,7 @@ def make_handler(svc: Service):
                     query = parse_qs(self.path.partition("?")[2])
                     try:
                         code, body = svc.slot_action(path[len("/slots/"):], (query.get("action") or [""])[0],
-                                                     req.get("filename"), req.get("session"))
+                                                     req.get("filename"), req.get("session"), req.get("base"))
                     except EngineDied as e:                  # EngineSilent included: the engine was ended
                         code, body = 500, {"error": {"code": 500, "message": str(e) + "; the next request starts "
                                                      "the engine again", "type": "server_error"}}

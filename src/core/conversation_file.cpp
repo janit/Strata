@@ -48,6 +48,10 @@ constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
 constexpr uint32_t kVersion = 1;
 constexpr size_t kHeader = 64, kTrailer = 16;
+// kv-export: delta files (STRSDLT v1): an 80-byte header, the same trailer size
+constexpr char kDeltaMagic[8] = {'S', 'T', 'R', 'S', 'D', 'L', 'T', '\x01'};
+constexpr char kDeltaEnd[8] = {'S', 'T', 'R', 'S', 'D', 'E', 'N', 'D'};
+constexpr size_t kDeltaHeader = 80;
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
 // - the last, partial block included - so a small file reports too, and each report follows real movement.
@@ -712,12 +716,37 @@ struct Out {
         u64(b.size());
         b.visit(0, b.size(), [&](const uint8_t* p, size_t c, size_t) { raw(p, c); return ok; });
     }
-    // a K/V part pulled from its owner straight into the file block (sizing pass: counted, never read)
+    // kv-export: chunk hashes out, and the delta being written (layer: the K/V layer being written)
+    SessionKvChunks* chunks = nullptr;
+    const SessionDelta* delta = nullptr;
+    size_t layer = 0;
+    // a K/V part pulled from its owner straight into the file block (sizing pass: counted, never read).  A delta
+    // writes (size, keep, the bytes from keep on, the chunk hashes); chunk hashes are computed as the bytes pass.
     void source(const SessionKvSource& s, size_t part) {
         const size_t size = s.sizes[part];
+        const size_t keep = delta ? (size_t) delta->keep[layer][part] : 0;
+        const size_t n_chunks = (size_t) ((size + kSessionChunk - 1) / kSessionChunk);
         u64(size);
-        if (!f) { count(size); return; }
-        for (size_t at = 0; at < size && ok;) {
+        if (delta) u64(keep);
+        std::vector<uint64_t> hashes;
+        const bool hashing = f && (chunks || delta);
+        if (hashing) {
+            hashes.reserve(n_chunks);
+            if (keep) hashes.assign(delta->base_chunks->at(layer)[part].begin(),
+                                    delta->base_chunks->at(layer)[part].begin() + (ptrdiff_t) (keep / kSessionChunk));
+        }
+        SessionHasher piece(0);
+        size_t in_piece = 0;
+        auto chunk_bytes = [&](const uint8_t* p, size_t c) {
+            while (c) {
+                const size_t t = std::min<size_t>(c, kSessionChunk - in_piece);
+                piece.update(p, t);
+                in_piece += t; p += t; c -= t;
+                if (in_piece == kSessionChunk) { hashes.push_back(piece.digest()); piece = SessionHasher(0); in_piece = 0; }
+            }
+        };
+        if (!f) count(size - keep);
+        for (size_t at = keep; f && at < size && ok;) {
             size_t room = 0;
             uint8_t* d = f->span(room);
             const size_t c = std::min(room, size - at);
@@ -731,12 +760,23 @@ struct Out {
                 return;
             }
             if (hash) hash->update(d, c);
+            if (hashing) chunk_bytes(d, c);
             count(c);
             const auto t2 = std::chrono::steady_clock::now();
             ok = ok && f->commit(c);
             disk_ms += since(t2);
             at += c;
         }
+        if (hashing && ok && in_piece) hashes.push_back(piece.digest());
+        if (delta) {
+            u64(n_chunks);
+            if (!f) count(n_chunks * 8);
+            else if (ok) {
+                if (hashes.size() != n_chunks) { ok = false; read_failed = true; read_error = "chunk hash count"; return; }
+                raw(hashes.data(), hashes.size() * 8);
+            }
+        }
+        if (hashing && ok && chunks) (*chunks)[layer][part] = std::move(hashes);
     }
     bool read_failed = false;
     std::string read_error;
@@ -773,7 +813,10 @@ void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKv
     }
     if (sources) {
         o.u64(sources->size());
-        for (const auto& k : *sources) {
+        if (o.chunks) o.chunks->assign(sources->size(), {});
+        for (size_t j = 0; j < sources->size(); ++j) {
+            const auto& k = (*sources)[j];
+            o.layer = j;
             put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
             for (size_t part = 0; part < 5; ++part) o.source(k, part);
         }
@@ -893,6 +936,65 @@ void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
     std::memcpy(h + 32, &payload, 8);
     const uint64_t hh = session_hash64(h, 56, 0);
     std::memcpy(h + 56, &hh, 8);
+}
+
+// kv-export: the 80-byte STRSDLT v1 header
+void delta_header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload, const SessionDelta& d,
+                        uint64_t full_size) {
+    std::memset(h, 0, kDeltaHeader);
+    std::memcpy(h, kDeltaMagic, 8);
+    const uint32_t version = 1, size = kDeltaHeader;
+    std::memcpy(h + 8, &version, 4);
+    std::memcpy(h + 12, &size, 4);
+    std::memcpy(h + 16, &id.model, 8);
+    std::memcpy(h + 24, &id.config, 8);
+    std::memcpy(h + 32, &payload, 8);
+    std::memcpy(h + 40, &d.base, 8);
+    std::memcpy(h + 48, &d.id, 8);
+    std::memcpy(h + 56, &full_size, 8);
+    const uint64_t hh = session_hash64(h, 72, 0);
+    std::memcpy(h + 72, &hh, 8);
+}
+
+// kv-export: an image's own K/V as sources, so a host image can be hashed in chunks or written as a delta
+std::vector<SessionKvSource> image_sources(const SavedConversation& image) {
+    std::vector<SessionKvSource> out;
+    for (const auto& k : image.kv) {
+        SessionKvSource s;
+        s.format = k.format; s.cells = k.cells; s.heads = k.heads; s.head_dim = k.head_dim;
+        s.page_size = k.page_size; s.pooled_rows = k.pooled_rows; s.idx_dim = k.idx_dim;
+        const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+        for (size_t i = 0; i < 5; ++i) s.sizes[i] = parts[i]->size();
+        s.read = [parts](size_t part, size_t offset, void* dst, size_t n) {
+            if (part >= 5 || offset > parts[part]->size() || n > parts[part]->size() - offset) return false;
+            uint8_t* d = static_cast<uint8_t*>(dst);
+            return parts[part]->visit(offset, n, [&](const uint8_t* p, size_t c, size_t at) {
+                std::memcpy(d + (at - offset), p, c);
+                return true;
+            });
+        };
+        s.error = [] { return std::string("K/V read out of range"); };
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+// kv-export: a delta's keep values against its sources: whole chunks, within the part and the base's chunks
+bool delta_valid(const SessionDelta& d, const std::vector<SessionKvSource>& kv, std::string& error) {
+    if (!d.id || !d.base_chunks || d.keep.size() != kv.size() || d.base_chunks->size() != kv.size()) {
+        error = "session file: the delta does not describe these K/V layers";
+        return false;
+    }
+    for (size_t j = 0; j < kv.size(); ++j)
+        for (size_t p = 0; p < 5; ++p) {
+            const uint64_t keep = d.keep[j][p];
+            if (keep % kSessionChunk || keep > kv[j].sizes[p] || keep / kSessionChunk > (*d.base_chunks)[j][p].size()) {
+                error = "session file: delta keep " + std::to_string(keep) + " of layer " + std::to_string(j) +
+                        " part " + std::to_string(p) + " is not whole chunks of both the part and the base";
+                return false;
+            }
+        }
+    return true;
 }
 } // namespace
 
@@ -1125,14 +1227,33 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
         return false;
     }
     if (checks) for (const auto* c : *checks) if (!c) { error = "session file: a null checkpoint"; return false; }
+    // kv-export: chunk hashes or a delta need the K/V as sources; an image's own K/V becomes sources here
+    std::vector<SessionKvSource> own;
+    if (!sources && (opt.kv_chunks || opt.delta)) {
+        own = image_sources(image);
+        sources = &own;
+    }
+    if (opt.delta && !delta_valid(*opt.delta, *sources, error)) return false;
     Out sizing;
+    sizing.delta = opt.delta;
     put_payload(sizing, image, sources, deepest_only, checks);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
         sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: the state is too large for this build";
         return false;
     }
-    const uint64_t payload = sizing.n, total = kHeader + payload + kTrailer;
+    uint64_t full_size = 0;   // a delta: the session file it rebuilds
+    if (opt.delta) {
+        Out whole;
+        put_payload(whole, image, sources, deepest_only, checks);
+        if (whole.overflow || whole.n > UINT64_MAX - kHeader - kTrailer) {
+            error = "session file: the state is too large for this build";
+            return false;
+        }
+        full_size = kHeader + whole.n + kTrailer;
+    }
+    const size_t header = opt.delta ? kDeltaHeader : kHeader;
+    const uint64_t payload = sizing.n, total = header + payload + kTrailer;
     st.error = SessionError::io;
     if (opt.min_free_bytes) {
         uint64_t avail = 0;
@@ -1162,18 +1283,21 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     const std::function<int(const char*)>* fault = opt.fault ? &opt.fault : nullptr;
     f.write_fault = injected(fault, "write");
     f.flush_fault = injected(fault, "file_flush");
-    uint8_t h[kHeader];
-    header_bytes(h, id, payload);
-    bool ok = f.write(h, kHeader);
+    uint8_t h[kDeltaHeader];
+    if (opt.delta) delta_header_bytes(h, id, payload, *opt.delta, full_size);
+    else header_bytes(h, id, payload);
+    bool ok = f.write(h, header);
     SessionHasher hash(0);
     Out out;
     out.f = &f;
     out.hash = &hash;
+    out.chunks = opt.kv_chunks;
+    out.delta = opt.delta;
     if (ok) put_payload(out, image, sources, deepest_only, checks);
     ok = ok && out.ok && out.n == payload;
     if (ok) {
         const uint64_t ph = hash.digest();
-        ok = f.write(&ph, 8) && f.write(kEnd, 8);
+        ok = f.write(&ph, 8) && f.write(opt.delta ? kDeltaEnd : kEnd, 8);
     }
     const auto tf = std::chrono::steady_clock::now();
     ok = f.finish(opt.durable) && ok;

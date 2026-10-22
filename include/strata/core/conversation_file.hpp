@@ -146,6 +146,20 @@ using SessionPhase = std::function<void(const char* phase, uint64_t bytes)>;
 int64_t session_phase_limit_s(uint64_t bytes);
 
 // Optional knobs of a write.
+// kv-export: incremental saves.  Every K/V part (k, v, k_scale, v_scale, pooled of each layer) is also described by
+// the session_hash64 (seed 0) of each kSessionChunk bytes of it (the last chunk may be shorter): a save can return
+// them, and a delta save against a base reuses the base's for the bytes it keeps.
+constexpr uint64_t kSessionChunk = 256u << 10;
+using SessionKvChunks = std::vector<std::array<std::vector<uint64_t>, 5>>;   // per K/V layer, per part
+// A delta file (STRSDLT v1) instead of a session file: each K/V part is written as (size, keep, the bytes from keep
+// on, the chunk hashes of the whole new part).  keep[layer][part] is a multiple of kSessionChunk (or 0) and at most the
+// part's size and the base's: the receiver rebuilds the session file from the base save it holds.
+struct SessionDelta {
+    uint64_t base = 0, id = 0;                    // the base save's id and this save's
+    std::vector<std::array<uint64_t, 5>> keep;   // per K/V layer
+    const SessionKvChunks* base_chunks = nullptr; // the base's chunk hashes: the first keep / kSessionChunk are reused
+};
+
 struct SessionWriteOptions {
     // the free-space PREFLIGHT: refused when the disk has less than the new file plus this many bytes free before the
     // write starts.  Not a reservation: other writers can take the space afterwards.
@@ -162,6 +176,10 @@ struct SessionWriteOptions {
     // kv-export: hand each full 16 MiB block to a writer thread and fill the next meanwhile (the disk then overlaps
     // the hashing and the K/V reads); off when the second block cannot be allocated
     bool write_behind = true;
+    // kv-export: out - the chunk hashes of every K/V part written (the whole parts, also in a delta save)
+    SessionKvChunks* kv_chunks = nullptr;
+    // kv-export: write a delta file against this base instead of a session file
+    const SessionDelta* delta = nullptr;
 };
 
 // Writes a temporary file beside `path` (a unique hidden name, created exclusively: never an existing file or link;
