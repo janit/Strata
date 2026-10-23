@@ -27,6 +27,7 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+import array
 import contextlib
 import collections
 import base64
@@ -945,6 +946,33 @@ def parse_stage_in_flight_sample(line: str) -> dict | None:
             any(value > elapsed_us for value in in_flight_us):
         return None
     return {"elapsed_us": elapsed_us, "in_flight_us": in_flight_us}
+
+
+# kv-export: the client session of the request this thread serves (X-Session-Id / X-Session-Affinity), so the
+# conversation it ends in can be saved by name afterwards (POST /slots/session?action=save)
+KV_SESSION = threading.local()
+KV_SESSIONS_KEPT = 1024
+KV_SESSIONS_BYTES = 64 << 20    # their prompts, packed int32: 64 MiB is ~16M tokens (~320 conversations of 50k)
+
+
+def kv_session_id(headers) -> str | None:
+    # the order viiwork routes by (internal/proxy sessionKey): X-Session-Affinity, then X-Session-Id
+    # (the first non-empty one as it stands, like viiwork; one with spaces or controls names no session)
+    sid = headers.get("X-Session-Affinity") or headers.get("X-Session-Id") or ""
+    return sid[:256] if sid and all(32 < ord(c) < 127 for c in sid) else None
+
+
+def fnv1a64_ids(ids) -> int:
+    """kv-export: FNV-1a 64 over the token ids as little-endian int32, as the engine's SAVEC computes it."""
+    data = (ids if isinstance(ids, array.array) and ids.typecode == "i" else array.array("i", ids)).tobytes()
+    if sys.byteorder != "little":
+        a = array.array("i", data)
+        a.byteswap()
+        data = a.tobytes()
+    h = 0xcbf29ce484222325
+    for b in data:
+        h = ((h ^ b) * 0x100000001b3) & 0xffffffffffffffff
+    return h
 
 
 class StrataEngine:
@@ -2356,7 +2384,7 @@ class StrataEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
-    def session_file(self, action: str, path: str) -> dict:
+    def session_file(self, action: str, path: str, conv: tuple | None = None) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
@@ -2368,16 +2396,32 @@ class StrataEngine:
         a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
         explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
         that never ends is still ended."""
-        if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
+        if action not in ("save", "restore", "import") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
+        if conv is not None and action != "save":
+            raise ValueError("invalid session command")
+        # kv-export: `conv` = (where, n, hash): SAVEC saves the conversation whose first n ids hash to `hash`
+        # (fnv1a64_ids) from batch slot `where` (or the live session, -1, else a parked one), and the engine refuses
+        # if it is no longer held there
+        # (where, n, hash, base): SAVEX - the same, remembered by the engine, and a delta file against the earlier
+        # SAVEX `base` (0: none) when it can; the answer adds "save_id" and "base" (None: a full session file)
+        if conv is None:
+            cmd = f"{action.upper()} {path}\n"
+        elif len(conv) == 4:
+            cmd = f"SAVEX {int(conv[0])} {int(conv[1])} {int(conv[2]):016x} {int(conv[3]):016x} {path}\n"
+        else:
+            cmd = f"SAVEC {int(conv[0])} {int(conv[1])} {int(conv[2]):016x} {path}\n"
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
-            self.proc.stdin.flush()
+            with getattr(self, "wlock", None) or contextlib.nullcontext():
+                self.proc.stdin.write(cmd)
+                self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
-        want = "SAVED" if action == "save" else "RESTORED"
+        want = {"save": "SAVED", "restore": "RESTORED", "import": "IMPORTED"}[action]
+        if conv is not None and len(conv) == 4:
+            want = "SAVEDX"
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
@@ -2442,14 +2486,19 @@ class StrataEngine:
                 raise SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
             if head == want:
                 try:
-                    if len(f) != 4:
+                    if len(f) != (6 if want == "SAVEDX" else 4):
                         raise ValueError
                     tokens, size, ms = count(f[1]), count(f[2]), float(f[3])
                     if not math.isfinite(ms) or ms < 0:
                         raise ValueError
+                    out = {"tokens": tokens, "bytes": size, "ms": ms}
+                    if want == "SAVEDX":
+                        if not all(len(x) == 16 and all(c in "0123456789abcdef" for c in x) for x in f[4:6]):
+                            raise ValueError
+                        out["save_id"], out["base"] = f[4], (f[5] if int(f[5], 16) else None)
                 except ValueError:
                     raise out_of_step(line) from None
-                return {"tokens": tokens, "bytes": size, "ms": ms}
+                return out
             if head == "INFO" or head == "WARN":          # engine log lines may interleave; they are not answers
                 heard = time.monotonic()
                 continue
@@ -3999,7 +4048,7 @@ class Service:
             cancel.set()
         return len(active)
 
-    def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
+    def slot_action(self, slot: str, action: str, filename, session=None, base=None) -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
         to or from a file in slot_save_path.  -> (HTTP status, body)."""
         def error(code, message):
@@ -4007,19 +4056,23 @@ class Service:
                                     "type": "invalid_request_error" if code < 500 else "server_error"}}
         if not self.slot_save_path or not hasattr(self.engine, "session_file"):
             return error(501, "slot save/restore is disabled (start the server with --slot-save-path DIR)")
+        if slot == "session":
+            return self.session_save(action, filename, session, error, base)
+        if getattr(self.engine, "batch", 0) and action == "import" and slot == "0":
+            return self.session_import_batch(filename, error)
         if getattr(self.engine, "batch", 0):
             # #465 parallel requests do not hold the FIFO and share the engine's control lines: a session file
             # could interleave with a request being admitted, so the two are not combined (the engine refuses too)
             return error(501, "slot save/restore is not available with parallel requests (\"parallel\" / --batch)")
         if slot != "0":
             return error(400, "this server has one slot: 0")
-        if action not in ("save", "restore"):
-            return error(400, "action must be save or restore")
+        if action not in ("save", "restore", "import"):
+            return error(400, "action must be save, restore or import")
         why = slot_filename_problem(filename)
         if why:
             return error(400, f"filename {why}")
         path = os.path.join(self.slot_save_path, filename)
-        if action == "restore":
+        if action in ("restore", "import"):
             try:
                 os.lstat(path)                              # the engine opens it without following a link
             except OSError:
@@ -4036,8 +4089,8 @@ class Service:
                 if not self.loaded():
                     return error(503, "the model is not loaded")
                 with self.status_lock:
-                    self.status.update(busy=True, phase="saving the session" if action == "save"
-                                       else "restoring a session", started=time.time(), first_token=None,
+                    self.status.update(busy=True, phase={"save": "saving the session", "restore": "restoring a session",
+                                       "import": "importing a session"}[action], started=time.time(), first_token=None,
                                        prompt_tokens=None, generated=None, max_tokens=None)
                 try:
                     if action == 'save' and getattr(self.engine, 'session_save_reclaim', False):
@@ -4064,8 +4117,114 @@ class Service:
         if action == "save":
             return 200, {"id_slot": 0, "filename": filename, "n_saved": r["tokens"], "n_written": r["bytes"],
                          "timings": {"save_ms": r["ms"]}}
+        if action == "import":
+            return 200, {"id_slot": 0, "filename": filename, "n_imported": r["tokens"], "n_read": r["bytes"],
+                         "timings": {"import_ms": r["ms"]}}
         return 200, {"id_slot": 0, "filename": filename, "n_restored": r["tokens"], "n_read": r["bytes"],
                      "timings": {"restore_ms": r["ms"]}}
+
+    def session_save(self, action, filename, session, error, base=None) -> tuple[int, dict]:
+        """kv-export: POST /slots/session?action=save {"session": ID, "filename": NAME} saves the conversation the
+        client session ID last continued (its requests carried X-Session-Id or X-Session-Affinity), wherever it is now:
+        the batch slot that holds it, else the live session, else (the engine looks) the conversation cache, where a
+        later request of another session parked it.  With parallel requests it takes the control lines like
+        an admission.  409 when that conversation is no longer held (another took its slot)."""
+        if action != "save":
+            return error(400, "/slots/session supports action=save")
+        why = slot_filename_problem(filename)
+        if why:
+            return error(400, f"filename {why}")
+        with self.status_lock:
+            ids = (self.__dict__.get("kv_sessions") or {}).get(session) if isinstance(session, str) else None
+        if not ids:
+            return error(404, "no request of that session on this server")
+        if base is not None and not (isinstance(base, str) and len(base) == 16 and
+                                     all(c in "0123456789abcdef" for c in base)):
+            return error(400, "base must be a save_id: 16 lowercase hex digits")
+        base_id = int(base, 16) if base else 0
+        path = os.path.join(self.slot_save_path, filename)
+        eng = self.engine
+        if not self.loaded():
+            return error(503, "the model is not loaded")
+        name = fnv1a64_ids(ids)                         # ~36 ms per 50k tokens: before the control lines, not inside
+        try:
+            if getattr(eng, "batch", 0):
+                with eng.slot_cv:                           # the idle slot holding the longest start with these ids
+                    where, held = -1, 0
+                    for b in range(eng.batch):
+                        h = eng.slot_held[b]
+                        if (not eng.slot_busy[b] and len(h) >= len(ids) and len(h) > held and
+                                array.array("i", h[:len(ids)]) == ids):
+                            where, held = b, len(h)
+                r = self.with_control(lambda: eng.session_file("save", path, (where, len(ids), name, base_id)))
+            else:
+                where = -1
+                with self.fifo:
+                    r = eng.session_file("save", path, (where, len(ids), name, base_id))
+        except SessionRefused as e:
+            code = 409 if "no longer held" in str(e) or "decoding" in str(e) else e.status
+            body = error(code, str(e))
+            body[1]["error"]["kind"] = e.kind
+            return body
+        except ValueError as e:
+            return error(400, str(e))
+        return 200, {"id_slot": where, "session": session, "filename": filename, "n_saved": r["tokens"],
+                     "n_written": r["bytes"], "timings": {"save_ms": r["ms"]}, "save_id": r["save_id"],
+                     "base": r["base"], "delta": r["base"] is not None}
+
+    def kv_note(self, sid, ids) -> None:
+        """kv-export: the conversation client session `sid` continues starts with these ids (the last
+        KV_SESSIONS_KEPT sessions, at most KV_SESSIONS_BYTES of ids), for POST /slots/session?action=save."""
+        if not sid:
+            return
+        packed = array.array("i", ids)              # 4 bytes a token (a list of ints is ~36)
+        with self.status_lock:
+            kept = self.__dict__.setdefault("kv_sessions", collections.OrderedDict())
+            old = kept.pop(sid, None)
+            self.kv_sessions_bytes = self.__dict__.get("kv_sessions_bytes", 0) + packed.itemsize * len(packed) - \
+                (old.itemsize * len(old) if old is not None else 0)
+            kept[sid] = packed
+            # the oldest sessions go first; the newest stays even when it alone is over the budget
+            while len(kept) > 1 and (len(kept) > KV_SESSIONS_KEPT or self.kv_sessions_bytes > KV_SESSIONS_BYTES):
+                _, gone = kept.popitem(last=False)
+                self.kv_sessions_bytes -= gone.itemsize * len(gone)
+
+    def with_control(self, fn):
+        """kv-export: fn() while holding the engine's control lines, as an admission does (parallel requests only):
+        a session command between two admissions, never inside one.  The slots keep decoding meanwhile."""
+        eng = self.engine
+        for _ in eng._take_control(threading.Event(), 0):  # heartbeats while an admission holds the lines
+            pass
+        try:
+            return fn()
+        finally:
+            eng.ctl.release()
+            with eng.slot_cv:
+                eng.slot_cv.notify_all()
+
+    def session_import_batch(self, filename, error) -> tuple[int, dict]:
+        """kv-export: POST /slots/0?action=import with parallel requests: the engine parks the file (it never touches
+        the live session or a slot), so it only needs the control lines, not the FIFO."""
+        why = slot_filename_problem(filename)
+        if why:
+            return error(400, f"filename {why}")
+        path = os.path.join(self.slot_save_path, filename)
+        try:
+            os.lstat(path)                                  # the engine opens it without following a link
+        except OSError:
+            return error(404, f"no saved session named {filename}")
+        if not self.loaded():
+            return error(503, "the model is not loaded")
+        try:
+            r = self.with_control(lambda: self.engine.session_file("import", path))
+        except SessionRefused as e:
+            body = error(e.status, str(e))
+            body[1]["error"]["kind"] = e.kind
+            return body
+        except ValueError as e:
+            return error(400, str(e))
+        return 200, {"id_slot": 0, "filename": filename, "n_imported": r["tokens"], "n_read": r["bytes"],
+                     "timings": {"import_ms": r["ms"]}}
 
     def set_aliases(self, aliases) -> None:
         """#297: the config's `aliases` - a list of names (or one comma-separated string), like llama-server's --alias.
@@ -5002,6 +5161,7 @@ class Service:
              declared_only=False) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
+        self.kv_note(getattr(KV_SESSION, "sid", None), ids)
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
         defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
@@ -6728,13 +6888,14 @@ def make_handler(svc: Service):
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
+                KV_SESSION.sid = kv_session_id(self.headers)
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path.startswith("/slots/"):
                     query = parse_qs(self.path.partition("?")[2])
                     try:
                         code, body = svc.slot_action(path[len("/slots/"):], (query.get("action") or [""])[0],
-                                                     req.get("filename"))
+                                                     req.get("filename"), req.get("session"), req.get("base"))
                     except EngineDied as e:                  # EngineSilent included: the engine was ended
                         code, body = 500, {"error": {"code": 500, "message": str(e) + "; the next request starts "
                                                      "the engine again", "type": "server_error"}}

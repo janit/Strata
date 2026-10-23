@@ -3,6 +3,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -97,6 +98,106 @@ SavedConversation sample() {
 constexpr size_t kGoldenSize = 17878535;
 constexpr uint64_t kGoldenHash = 0x70f812b350360d09ull;
 
+
+// kv-export: the reference rebuild of a session file from its base and a delta (STRSDLT v1) - the receiver's job,
+// written out here as the format's executable description.
+uint64_t rd64(const std::vector<char>& f, size_t at) { uint64_t v; std::memcpy(&v, f.data() + at, 8); return v; }
+struct PartAt { size_t off = 0, size = 0; };
+// a STRSESS file: where each K/V part's bytes are
+bool strsess_parts(const std::vector<char>& f, std::vector<std::array<PartAt, 5>>& parts) {
+    size_t at = 64 + 18 * 8 + 3 * 8;
+    auto need = [&](size_t n) { return at <= f.size() && n <= f.size() - at; };
+    auto checkpoint = [&] {
+        if (!need(8)) return false;
+        at += 8 + rd64(f, at) * 4;                    // ids
+        if (!need(8)) return false;
+        at += 8 + rd64(f, at) * 16;                   // images
+        for (int i = 0; i < 5; ++i) { if (!need(8)) return false; at += 8 + rd64(f, at); }   // gdn ple tails dead block_pos
+        at += 8;                                      // used
+        return need(0);
+    };
+    if (!checkpoint() || !need(8)) return false;
+    const uint64_t checks = rd64(f, at); at += 8;
+    for (uint64_t i = 0; i < checks; ++i) if (!checkpoint()) return false;
+    if (!need(8)) return false;
+    const uint64_t layers = rd64(f, at); at += 8;
+    parts.assign(layers, {});
+    for (uint64_t j = 0; j < layers; ++j) {
+        at += 7 * 8;
+        for (auto& p : parts[j]) {
+            if (!need(8)) return false;
+            p.size = rd64(f, at); at += 8;
+            if (!need(p.size)) return false;
+            p.off = at; at += p.size;
+        }
+    }
+    return at + 16 == f.size();
+}
+bool rebuild(const std::vector<char>& base, const std::vector<char>& d, std::vector<char>& out, std::string& why) {
+    auto fail = [&](const char* w) { why = w; return false; };
+    if (d.size() < 96 || std::memcmp(d.data(), "STRSDLT\x01", 8) != 0) return fail("delta magic");
+    uint32_t version, hsize;
+    std::memcpy(&version, d.data() + 8, 4); std::memcpy(&hsize, d.data() + 12, 4);
+    if (version != 1 || hsize != 80 || rd64(d, 72) != session_hash64(d.data(), 72, 0)) return fail("delta header");
+    const uint64_t payload = rd64(d, 32), full = rd64(d, 56);
+    if (80 + payload + 16 != d.size() || std::memcmp(d.data() + d.size() - 8, "STRSDEND", 8) != 0) return fail("delta size");
+    if (rd64(d, d.size() - 16) != session_hash64(d.data() + 80, payload, 0)) return fail("delta payload hash");
+    if (rd64(d, 16) != rd64(base, 16) || rd64(d, 24) != rd64(base, 24)) return fail("identity");
+    std::vector<std::array<PartAt, 5>> bp;
+    if (!strsess_parts(base, bp)) return fail("base layout");
+    std::vector<char> body;                           // the rebuilt payload
+    size_t at = 80;
+    auto copy = [&](size_t n) { body.insert(body.end(), d.begin() + (ptrdiff_t) at, d.begin() + (ptrdiff_t) (at + n)); at += n; };
+    auto checkpoint = [&] {
+        copy(8 + rd64(d, at) * 4);
+        copy(8 + rd64(d, at) * 16);
+        for (int i = 0; i < 5; ++i) copy(8 + rd64(d, at));
+        copy(8);
+    };
+    copy(18 * 8 + 3 * 8);
+    checkpoint();
+    const uint64_t checks = rd64(d, at); copy(8);
+    for (uint64_t i = 0; i < checks; ++i) checkpoint();
+    const uint64_t layers = rd64(d, at); copy(8);
+    if (layers != bp.size()) return fail("layer count");
+    for (uint64_t j = 0; j < layers; ++j) {
+        copy(7 * 8);
+        for (size_t p = 0; p < 5; ++p) {
+            const uint64_t size = rd64(d, at), keep = rd64(d, at + 8);
+            at += 16;
+            if (keep > size || keep % kSessionChunk || keep > bp[j][p].size) return fail("keep");
+            const size_t start = body.size();
+            body.insert(body.end(), (const char*) &size, (const char*) &size + 8);
+            body.insert(body.end(), base.begin() + (ptrdiff_t) bp[j][p].off, base.begin() + (ptrdiff_t) (bp[j][p].off + keep));
+            body.insert(body.end(), d.begin() + (ptrdiff_t) at, d.begin() + (ptrdiff_t) (at + size - keep));
+            at += size - keep;
+            const uint64_t n = rd64(d, at); at += 8;
+            if (n != (size + kSessionChunk - 1) / kSessionChunk) return fail("chunk count");
+            for (uint64_t i = 0; i < n; ++i) {        // every chunk of the rebuilt part against the engine's hash
+                const size_t c0 = start + 8 + i * kSessionChunk, c = (size_t) std::min<uint64_t>(kSessionChunk, size - i * kSessionChunk);
+                if (session_hash64(body.data() + c0, c, 0) != rd64(d, at + i * 8)) return fail("chunk hash");
+            }
+            at += n * 8;
+        }
+    }
+    if (at != 80 + payload) return fail("delta payload walk");
+    out.assign(64, 0);
+    std::memcpy(out.data(), "STRSESS\x01", 8);
+    const uint32_t v1 = 1, h64 = 64;
+    std::memcpy(out.data() + 8, &v1, 4); std::memcpy(out.data() + 12, &h64, 4);
+    std::memcpy(out.data() + 16, d.data() + 16, 16);  // model, config
+    const uint64_t pl = body.size();
+    std::memcpy(out.data() + 32, &pl, 8);
+    const uint64_t hh = session_hash64(out.data(), 56, 0);
+    std::memcpy(out.data() + 56, &hh, 8);
+    out.insert(out.end(), body.begin(), body.end());
+    const uint64_t ph = session_hash64(body.data(), body.size(), 0);
+    out.insert(out.end(), (const char*) &ph, (const char*) &ph + 8);
+    out.insert(out.end(), "STRSEND\x01", "STRSEND\x01" + 8);
+    if (out.size() != full) return fail("full size");
+    return true;
+}
+
 bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
     return a.ids == b.ids && a.imgs == b.imgs && a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails &&
            a.dead == b.dead && a.block_pos == b.block_pos && a.used == b.used && b.stage_parts.empty();
@@ -151,6 +252,11 @@ bool rejects(const fs::path& p, const SessionFileIdentity& id, const char* expec
 } // namespace
 
 int main() {
+    {   // kv-export: the conversation name SAVEC checks; the same vector is pinned in serve/test_kv_export.py
+        const int32_t ids[] = {0, 1, -1, 151643};
+        check(session_ids_fnv1a64(ids, 4) == 0x2401b33d3e943579ULL, "SAVEC ids hash matches the server's");
+        check(session_ids_fnv1a64(ids, 0) == 14695981039346656037ULL, "SAVEC ids hash of nothing is the basis");
+    }
     const fs::path dir = fs::temp_directory_path() / ("strata-session-test-" + std::to_string(
         std::chrono::steady_clock::now().time_since_epoch().count()));
     fs::create_directories(dir);
@@ -189,6 +295,164 @@ int main() {
         check(session_file_read(good.string(), id, back, read, error), "read succeeds");
         check(read == written, "read reports the file size");
         check(same(original, back), "round trip is identical");
+    }
+    // kv-export: a parked image keeps its chain; its file keeps only the deepest checkpoint, byte for byte the file
+    // of the same image holding that checkpoint alone
+    {
+        const fs::path parked = dir / "parked.bin", alone = dir / "alone.bin";
+        size_t pw = 0, aw = 0;
+        check(session_file_write_parked(parked.string(), original, id, pw, error), "parked write succeeds");
+        SavedConversation one = sample();
+        one.checkpoints.erase(one.checkpoints.begin());   // sample(): checkpoints at 10 and 500 tokens
+        check(session_file_write(alone.string(), one, id, aw, error), "write of the deepest alone");
+        check(pw == aw && slurp(parked) == slurp(alone), "parked write keeps only the deepest checkpoint");
+        SavedConversation back;
+        size_t read = 0;
+        check(session_file_read(parked.string(), id, back, read, error) && same(one, back), "parked file reads back");
+        check(original.checkpoints.size() == 2, "parked write leaves the image untouched");
+    }
+    // kv-export: the writer thread (write_behind, on by default) writes the same bytes as writing each block in place
+    {
+        const fs::path behind = dir / "behind.bin", inplace = dir / "inplace.bin";
+        size_t bw = 0, iw = 0;
+        SessionWriteOptions sync_opt;
+        sync_opt.write_behind = false;
+        std::vector<uint64_t> reports;
+        SessionWriteOptions behind_opt;
+        behind_opt.progress = [&](uint64_t done, uint64_t) { reports.push_back(done); };
+        check(session_file_write(behind.string(), original, id, bw, error, behind_opt), "write-behind write");
+        check(session_file_write(inplace.string(), original, id, iw, error, sync_opt), "in-place write");
+        check(bw == iw && slurp(behind) == slurp(inplace), "write-behind writes the same bytes");
+        check(reports.size() >= 3 && reports.front() == 0 && reports.back() == bw &&
+                  std::is_sorted(reports.begin(), reports.end()), "write-behind progress rises to the file size");
+    }
+    // kv-export: checkpoints by reference write the same file as the image holding copies of them
+    {
+        const fs::path byref = dir / "byref.bin", copied = dir / "copied.bin";
+        size_t rw = 0, cw = 0;
+        SavedConversation bare = sample();
+        const std::vector<ConversationCheckpoint> chain = std::move(bare.checkpoints);
+        bare.checkpoints.clear();
+        SessionWriteOptions opt;
+        opt.checkpoints = std::vector<const ConversationCheckpoint*>{&chain[1]};
+        check(session_file_write(byref.string(), bare, id, rw, error, opt), "write with checkpoints by reference");
+        SavedConversation one = sample();
+        one.checkpoints.erase(one.checkpoints.begin());
+        check(session_file_write(copied.string(), one, id, cw, error), "write with the checkpoint copied");
+        check(rw == cw && slurp(byref) == slurp(copied), "checkpoints by reference write the same bytes");
+        check(!session_file_write((dir / "both.bin").string(), original, id, rw, error, opt) &&
+                  error.find("both") != std::string::npos, "checkpoints in the image and the options are refused");
+        error.clear();
+    }
+    // kv-export: delta saves (STRSDLT v1).  base = sample(); next = the same conversation a turn later: layer 0's k
+    // grew and changed after 5 MiB, layer 1's v changed after 1 KiB, the live state and checkpoints are new.
+    {
+        const fs::path basef = dir / "dbase.bin", deltaf = dir / "ddelta.bin", fullf = dir / "dfull.bin";
+        SessionKvChunks base_chunks, full_chunks, delta_chunks;
+        size_t w = 0;
+        SessionWriteOptions bo;
+        bo.kv_chunks = &base_chunks;
+        check(session_file_write(basef.string(), original, id, w, error, bo), "delta: base written with chunk hashes");
+        check(base_chunks.size() == 3 && base_chunks[0][0].size() == ((17u << 20) + 5 + kSessionChunk - 1) / kSessionChunk &&
+                  base_chunks[0][0][0] == [&] {
+                      SessionHasher h(0);
+                      original.kv[0].k.visit(0, kSessionChunk, [&](const uint8_t* p, size_t c, size_t) { h.update(p, c); return true; });
+                      return h.digest();
+                  }(),
+              "delta: chunk hashes of the base");
+        SavedConversation next = sample();
+        next.live = checkpoint(1100, 9);
+        next.checkpoints = {checkpoint(1000, 8)};
+        {
+            ConversationBuffer k = pattern((18u << 20) + 77, 0);
+            original.kv[0].k.visit(0, 5u << 20, [&](const uint8_t* p, size_t c, size_t at) {
+                k.visit(at, c, [&](uint8_t* q, size_t c2, size_t at2) { std::memcpy(q, p + (at2 - at), c2); return true; });
+                return true;
+            });
+            k.visit(5u << 20, 1, [](uint8_t* q, size_t, size_t) { *q ^= 0x5a; return true; });
+            next.kv[0].k = std::move(k);
+            next.kv[1].v.visit(1024, 1, [](uint8_t* q, size_t, size_t) { *q ^= 1; return true; });
+        }
+        SessionDelta d;
+        d.base = 0x1111111111111111ull;
+        d.id = 0x2222222222222222ull;
+        d.base_chunks = &base_chunks;
+        d.keep.assign(3, {});
+        d.keep[0][0] = 5u << 20;                       // 20 whole chunks, all before the first change
+        d.keep[0][1] = 4096 / kSessionChunk * kSessionChunk;   // 0: the part is smaller than a chunk
+        d.keep[2][0] = 0;
+        SessionWriteOptions dopt;
+        dopt.delta = &d;
+        dopt.kv_chunks = &delta_chunks;
+        size_t dw = 0, fw = 0;
+        check(session_file_write(deltaf.string(), next, id, dw, error, dopt), "delta: delta written");
+        SessionWriteOptions fo;
+        fo.kv_chunks = &full_chunks;
+        check(session_file_write(fullf.string(), next, id, fw, error, fo), "delta: the full file of the same state");
+        check(dw < fw && delta_chunks == full_chunks, "delta: smaller, and the same chunk hashes as the full file");
+        std::vector<char> rebuilt;
+        std::string why;
+        const std::vector<char> base_bytes = slurp(basef), delta_bytes = slurp(deltaf), full_bytes = slurp(fullf);
+        check(rebuild(base_bytes, delta_bytes, rebuilt, why) && rebuilt == full_bytes,
+              ("delta: base + delta rebuilds the full file byte for byte " + why).c_str());
+        {
+            SavedConversation back;
+            size_t r = 0;
+            const fs::path rf = dir / "drebuilt.bin";
+            std::ofstream(rf, std::ios::binary).write(rebuilt.data(), (std::streamsize) rebuilt.size());
+            check(session_file_read(rf.string(), id, back, r, error) && same(next, back), "delta: the rebuilt file reads");
+        }
+        {   // what the chunk hashes protect: the receiver's copy.  A base damaged at rest inside the kept bytes, or a
+            // delta damaged on the way, fails the rebuild
+            std::vector<char> damaged = base_bytes;
+            std::vector<std::array<PartAt, 5>> bp;
+            check(strsess_parts(damaged, bp), "delta: base layout");
+            damaged[bp[0][0].off + 12345] ^= 1;
+            check(!rebuild(damaged, delta_bytes, rebuilt, why) && why == "chunk hash", "delta: a damaged base is caught");
+            std::vector<char> bent = delta_bytes;
+            bent[bent.size() - 40] ^= 1;
+            check(!rebuild(base_bytes, bent, rebuilt, why) && why == "delta payload hash", "delta: a damaged delta is caught");
+        }
+        {   // what they cannot protect: the engine's own keep.  Kept bytes take the base's hashes, so a keep past the
+            // first change rebuilds a consistent file with the base's (stale) bytes there: keep must be right
+            SessionDelta bad = d;
+            bad.keep[0][0] = 6u << 20;                 // past the change at 5 MiB
+            const fs::path bf = dir / "dbad.bin";
+            check(session_file_write(bf.string(), next, id, w, error, SessionWriteOptions{.delta = &bad}),
+                  "delta: a keep past the change is written (the engine cannot see it)");
+            check(rebuild(base_bytes, slurp(bf), rebuilt, why) && rebuilt != full_bytes,
+                  "delta: ... and rebuilds a consistent file that is not the new state");
+        }
+        {
+            SessionDelta odd = d;
+            odd.keep[0][0] = kSessionChunk + 1;
+            check(!session_file_write((dir / "dodd.bin").string(), next, id, w, error, SessionWriteOptions{.delta = &odd}) &&
+                      error.find("whole chunks") != std::string::npos, "delta: a keep that is not whole chunks is refused");
+            odd.keep[0][0] = (base_chunks[0][0].size() + 1) * kSessionChunk;
+            check(!session_file_write((dir / "dodd.bin").string(), next, id, w, error, SessionWriteOptions{.delta = &odd}),
+                  "delta: a keep past the base's chunks is refused");
+            error.clear();
+        }
+        {   // a parked image (no sources) as a delta, with only its deepest checkpoint
+            SavedConversation parked = next;
+            parked.checkpoints.insert(parked.checkpoints.begin(), checkpoint(10, 2));
+            const fs::path pf = dir / "dparked.bin";
+            check(session_file_write_parked(pf.string(), parked, id, w, error, SessionWriteOptions{.delta = &d}),
+                  "delta: a parked image written as a delta");
+            check(rebuild(base_bytes, slurp(pf), rebuilt, why) && rebuilt == full_bytes,
+                  "delta: the parked delta rebuilds the same full file");
+        }
+        if (const char* out = std::getenv("STRATA_KV_VECTORS_DIR")) {   // the small vector set for other implementations
+            const fs::path o = out;
+            fs::create_directories(o);
+            fs::copy_file(basef, o / "small-base.strsess", fs::copy_options::overwrite_existing);
+            fs::copy_file(deltaf, o / "small-delta.strsdlt", fs::copy_options::overwrite_existing);
+            fs::copy_file(fullf, o / "small-full.strsess", fs::copy_options::overwrite_existing);
+            std::ofstream m(o / "small-expected.txt");
+            m << std::hex << "base_save_id " << d.base << "\nnew_save_id " << d.id << "\nfull_size " << std::dec
+              << full_bytes.size() << "\nfull_payload_hash " << std::hex << rd64(full_bytes, full_bytes.size() - 16)
+              << "\ndelta_size " << std::dec << delta_bytes.size() << "\n";
+        }
     }
     // writing twice produces the same bytes (deterministic format)
     {

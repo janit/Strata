@@ -41,6 +41,9 @@ private:
     uint64_t total_ = 0;
 };
 uint64_t session_hash64(const void* data, size_t n, uint64_t seed);
+// kv-export: FNV-1a 64 over token ids as little-endian int32 - how SAVEC and the server (serve/server.py
+// fnv1a64_ids) name a conversation by its prompt.  {0, 1, -1, 151643} -> 0x2401b33d3e943579.
+uint64_t session_ids_fnv1a64(const int32_t* ids, size_t n);
 
 // Typed, length-delimited fields for an identity hash: each field is (tag, type, length, bytes), so two different
 // field lists never give the same byte stream, and a double is hashed by its exact bits (no decimal rounding).
@@ -124,6 +127,8 @@ struct SessionStatus {
     bool published = false;
     // write (POSIX): this filesystem cannot flush a folder (fsync EINVAL); the save succeeded without that flush
     bool dir_flush_unsupported = false;
+    // kv-export: write (streamed K/V): time inside the K/V sources' reads (device -> host) and inside the disk writes
+    double source_ms = 0, disk_ms = 0;
 };
 
 // Progress of a file transfer: (bytes done, bytes in the file).  A write reports once when its temporary file is
@@ -141,6 +146,20 @@ using SessionPhase = std::function<void(const char* phase, uint64_t bytes)>;
 int64_t session_phase_limit_s(uint64_t bytes);
 
 // Optional knobs of a write.
+// kv-export: incremental saves.  Every K/V part (k, v, k_scale, v_scale, pooled of each layer) is also described by
+// the session_hash64 (seed 0) of each kSessionChunk bytes of it (the last chunk may be shorter): a save can return
+// them, and a delta save against a base reuses the base's for the bytes it keeps.
+constexpr uint64_t kSessionChunk = 256u << 10;
+using SessionKvChunks = std::vector<std::array<std::vector<uint64_t>, 5>>;   // per K/V layer, per part
+// A delta file (STRSDLT v1) instead of a session file: each K/V part is written as (size, keep, the bytes from keep
+// on, the chunk hashes of the whole new part).  keep[layer][part] is a multiple of kSessionChunk (or 0) and at most the
+// part's size and the base's: the receiver rebuilds the session file from the base save it holds.
+struct SessionDelta {
+    uint64_t base = 0, id = 0;                    // the base save's id and this save's
+    std::vector<std::array<uint64_t, 5>> keep;   // per K/V layer
+    const SessionKvChunks* base_chunks = nullptr; // the base's chunk hashes: the first keep / kSessionChunk are reused
+};
+
 struct SessionWriteOptions {
     // the free-space PREFLIGHT: refused when the disk has less than the new file plus this many bytes free before the
     // write starts.  Not a reservation: other writers can take the space afterwards.
@@ -151,6 +170,16 @@ struct SessionWriteOptions {
     SessionPhase phase;
     // tests: return an errno value to make a step fail ("write", "file_flush", "rename", "dir_flush"), 0 to go on
     std::function<int(const char* step)> fault;
+    // kv-export: write these checkpoints (by reference, in this order) instead of the image's own list, so a save
+    // need not copy the deepest checkpoint (118 MB at this geometry) twice before writing it
+    std::optional<std::vector<const ConversationCheckpoint*>> checkpoints;
+    // kv-export: hand each full 16 MiB block to a writer thread and fill the next meanwhile (the disk then overlaps
+    // the hashing and the K/V reads); off when the second block cannot be allocated
+    bool write_behind = true;
+    // kv-export: out - the chunk hashes of every K/V part written (the whole parts, also in a delta save)
+    SessionKvChunks* kv_chunks = nullptr;
+    // kv-export: write a delta file against this base instead of a session file
+    const SessionDelta* delta = nullptr;
 };
 
 // Writes a temporary file beside `path` (a unique hidden name, created exclusively: never an existing file or link;
@@ -178,6 +207,12 @@ struct SessionKvSource {
 bool session_file_write(const std::string& path, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
                         const SessionFileIdentity& id, size_t& bytes, std::string& error,
                         const SessionWriteOptions& options = {}, SessionStatus* status = nullptr);
+
+// kv-export: a parked conversation (a host image) to a file, keeping only the checkpoint a save keeps
+// (session_deepest_checkpoint) of its chain: the same file a SAVE of it as the live session would write.
+bool session_file_write_parked(const std::string& path, const SavedConversation& image, const SessionFileIdentity& id,
+                               size_t& bytes, std::string& error, const SessionWriteOptions& options = {},
+                               SessionStatus* status = nullptr);
 
 // The checkpoints worth a disk write: the deepest one (the next turn's resume point when the live tail was
 // rewritten).  Earlier checkpoints only serve edits further back and cost ~118 MB each at this geometry.
