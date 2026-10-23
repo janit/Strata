@@ -99,8 +99,9 @@ Every save by session has a `save_id` (engine command `SAVEX`, answer `SAVEDX`).
 of an earlier save of the same conversation that the engine still remembers (its last 64 saves,
 per process), it writes a **delta file** instead of a session file. A delta keeps the bytes of the
 cells before the first token that differs from the base's tokens: whole pages, whole indexer rows,
-the draft one cell less, rounded down to whole 256 KiB chunks. Strata's own retained-K/V reuse
-keeps cells by the same rule. A conversation with pictures, a different control vector or another
+the draft one cell less, rounded down to whole 256 KiB chunks. A kept cell always holds the key and
+value of the same token at the same position as in the new state, so a delta never carries a cell
+of another token. A conversation with pictures, a different control vector or another
 K/V layout saves in full. `"delta": false` means a full session file (no base, an unknown base, or
 nothing to keep).
 
@@ -123,9 +124,30 @@ u64 size, the base part's first keep bytes and the delta's tail, then the traile
 
 What the chunk hashes protect is the receiver's copy (damage at rest, a wrong apply). Kept chunks
 carry the base's hashes, so they cannot catch a keep that went past a real change: that is the
-engine's rule above. It is checked on real saves. In one process, base + delta rebuilt the device's
-own full save of the same state byte for byte on all three paths: the live session, a parallel
-batch backend and a parked conversation.
+engine's rule above.
+
+**Byte for byte, or the same tokens.** The rule is by tokens, not bytes. When the engine reused every
+cell of the base since that save (the usual case: each turn appends to the conversation), base +
+delta rebuilds the engine's own full save of the same state byte for byte. When the conversation
+diverged inside the base (an edited or regenerated message), the engine resumes from its deepest
+checkpoint before the divergence and reads the cells after it again. Their bytes then differ
+slightly (float noise from another prefill chunk), and the delta keeps the base's copies of those
+cells up to the divergence. They hold the same tokens, so this is the same kind of difference as
+between two processes, never a stale cell. Tracking every point the engine read again since a base
+would make this exact too; it was not worth the complexity.
+
+Checked on real saves in one process (Strata v0.2.3.1, RTX A4000, 50k tokens). Each test compared
+base + delta with the device's own full save of the same state:
+
+| KV format | appended turn | diverged turn (another question after the same document) |
+|---|---|---|
+| int8 | identical (live, batch and parked paths) | cells 49,152-49,663 differ, all before the first differing token (50,003) |
+| q4_0 | identical | identical |
+| k8v4 | identical (batch path) | cells 49,152-49,663 differ, all before 50,003 |
+| fp16 | identical (parked path) | cells 49,152-49,919 differ, all before 50,003 |
+
+The delta is about 240 MB in every format, mostly the running state, which is rewritten whole. The
+full file is 0.69 GB (q4_0), 0.86 GB (k8v4), 1.0 GB (int8) or 1.65 GB (fp16). Every answer was correct.
 
 | 50k-token turn, RTX A4000 | full save | delta |
 |---|---|---|
