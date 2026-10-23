@@ -1,6 +1,7 @@
 # kv-export (fork of Strata)
 
-Branch `kv-export` of github.com/janit/Strata, based on Strata v0.1.45 (477ac13). It adds what a
+Branch `kv-export-0.2` of github.com/janit/Strata, based on Strata v0.2.3.1 (7ddc17a; branch `kv-export` is the same work
+on v0.1.45). It adds what a
 serving fleet needs to move a conversation between Strata processes on different hosts. Everything
 else behaves exactly as upstream does.
 
@@ -138,6 +139,25 @@ The server remembers the prompt of each session's last request so that it can fi
 conversation again. It keeps the last 1024 sessions, packed as int32 (4 bytes a token), with at
 most 64 MiB in total; the oldest go first. It hashes a prompt before taking the control lines (36
 ms per 50k tokens), not while holding them.
+
+## On v0.2.3.1
+
+Merged from v0.1.45 with no change to the additions: upstream did not touch the session-file or
+conversation-cache code, and the session commands keep v0.1.45's answers (`SERR`, `SESSION`,
+`SWAIT`). Checked again on teddy with this branch's image: base + delta rebuilt the full save byte
+for byte on the live, batch and parked paths (244 MB deltas in 0.19–0.26 s, full saves 0.56–0.70
+s), and a 50k-token conversation saved on one process, imported into another (1.2 s), went on
+there in 1.9 s with 50,029 tokens cached.
+
+Two upstream changes matter to a caller:
+
+- The conversation cache is on by default (sized from the free RAM), so IMPORT no longer needs an
+  explicit `--conversation-cache-mib`; `0` still turns it off.
+- The image layout is new: the server runs from `/opt/strata/terminal` with its own Python
+  (`/opt/strata/terminal/python/bin/python3 -m serve.server`), and the engine is
+  `/opt/strata/components/engine/<version>/strata`, whose folder must be in the config's
+  `lib_dirs` (it carries libcudart). The root `Dockerfile` needs
+  `--build-arg STRATA_COMMIT=$(git rev-parse HEAD)` (fixed here; upstream's fails without it).
 
 ## Tests
 
