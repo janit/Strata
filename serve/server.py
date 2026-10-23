@@ -959,7 +959,8 @@ def kv_session_id(headers) -> str | None:
     # the order viiwork routes by (internal/proxy sessionKey): X-Session-Affinity, then X-Session-Id
     # (the first non-empty one as it stands, like viiwork; one with spaces or controls names no session)
     sid = headers.get("X-Session-Affinity") or headers.get("X-Session-Id") or ""
-    return sid[:256] if sid and all(32 < ord(c) < 127 for c in sid) else None
+    # a longer id is no session (never cut short: two ids that start alike would share one remembered prompt)
+    return sid if sid and len(sid) <= 256 and all(32 < ord(c) < 127 for c in sid) else None
 
 
 def fnv1a64_ids(ids) -> int:
@@ -4143,31 +4144,37 @@ class Service:
             return error(400, "base must be a save_id: 16 lowercase hex digits")
         base_id = int(base, 16) if base else 0
         path = os.path.join(self.slot_save_path, filename)
-        eng = self.engine
-        if not self.loaded():
-            return error(503, "the model is not loaded")
         name = fnv1a64_ids(ids)                         # ~36 ms per 50k tokens: before the control lines, not inside
+        found = {"where": -1}
+
+        def save(eng):
+            if not getattr(eng, "batch", 0):
+                conv = (-1, len(ids), name, base_id)
+                if getattr(eng, "session_save_reclaim", False):
+                    from serve.session_save_retry import session_file
+                    return session_file(self, "save", path, SessionRefused, conv=conv)
+                return eng.session_file("save", path, conv)
+            with eng.slot_cv:                               # the idle slot holding the longest start with these ids
+                held = 0
+                for b in range(eng.batch):
+                    h = eng.slot_held[b]
+                    if (not eng.slot_busy[b] and len(h) >= len(ids) and len(h) > held and
+                            array.array("i", h[:len(ids)]) == ids):
+                        found["where"], held = b, len(h)
+            return self.with_control(lambda: eng.session_file("save", path, (found["where"], len(ids), name, base_id)))
         try:
-            if getattr(eng, "batch", 0):
-                with eng.slot_cv:                           # the idle slot holding the longest start with these ids
-                    where, held = -1, 0
-                    for b in range(eng.batch):
-                        h = eng.slot_held[b]
-                        if (not eng.slot_busy[b] and len(h) >= len(ids) and len(h) > held and
-                                array.array("i", h[:len(ids)]) == ids):
-                            where, held = b, len(h)
-                r = self.with_control(lambda: eng.session_file("save", path, (where, len(ids), name, base_id)))
-            else:
-                where = -1
-                with self.fifo:
-                    r = eng.session_file("save", path, (where, len(ids), name, base_id))
+            r = self.session_op("save", save)
         except SessionRefused as e:
-            code = 409 if "no longer held" in str(e) or "decoding" in str(e) else e.status
-            body = error(code, str(e))
+            # the engine refuses a well-formed SAVEC/SAVEX ("invalid") only for the state of that conversation: no
+            # longer held, decoding, partial, pictures - a conflict with what the engine holds now, not a bad request
+            body = error(409 if e.kind == "invalid" else e.status, str(e))
             body[1]["error"]["kind"] = e.kind
             return body
         except ValueError as e:
             return error(400, str(e))
+        if r is None:
+            return error(503, "the model is not loaded")
+        where = found["where"]
         return 200, {"id_slot": where, "session": session, "filename": filename, "n_saved": r["tokens"],
                      "n_written": r["bytes"], "timings": {"save_ms": r["ms"]}, "save_id": r["save_id"],
                      "base": r["base"], "delta": r["base"] is not None}
@@ -4188,6 +4195,40 @@ class Service:
             while len(kept) > 1 and (len(kept) > KV_SESSIONS_KEPT or self.kv_sessions_bytes > KV_SESSIONS_BYTES):
                 _, gone = kept.popitem(last=False)
                 self.kv_sessions_bytes -= gone.itemsize * len(gone)
+
+    def session_op(self, action, fn):
+        """kv-export: fn(engine) for a save by session or an import, with the bookkeeping slot_action keeps: counted
+        as queued while it waits, under the FIFO (so an unload, idle or asked for, waits for it: parallel requests do
+        not hold the FIFO, but unload() takes it), the engine checked as loaded once the FIFO is held, and the idle
+        timer told before and after.  None when the model is not loaded."""
+        self.last_request_at = time.time()
+        with self.status_lock:
+            self.status["queued"] += 1
+        waiting = True
+        try:
+            with self.fifo:
+                with self.status_lock:
+                    self.status["queued"] -= 1
+                waiting = False
+                if not self.loaded():
+                    return None
+                solo = not getattr(self.engine, "batch", 0)
+                if solo:                                    # with parallel requests "busy" is theirs to set
+                    with self.status_lock:
+                        self.status.update(busy=True, phase={"save": "saving the session",
+                                           "import": "importing a session"}[action], started=time.time(),
+                                           first_token=None, prompt_tokens=None, generated=None, max_tokens=None)
+                try:
+                    return fn(self.engine)
+                finally:
+                    if solo:
+                        with self.status_lock:
+                            self.status["busy"] = False
+                    self.last_request_at = time.time()
+        finally:
+            if waiting:
+                with self.status_lock:
+                    self.status["queued"] -= 1
 
     def with_control(self, fn):
         """kv-export: fn() while holding the engine's control lines, as an admission does (parallel requests only):
@@ -4213,16 +4254,16 @@ class Service:
             os.lstat(path)                                  # the engine opens it without following a link
         except OSError:
             return error(404, f"no saved session named {filename}")
-        if not self.loaded():
-            return error(503, "the model is not loaded")
         try:
-            r = self.with_control(lambda: self.engine.session_file("import", path))
+            r = self.session_op("import", lambda eng: self.with_control(lambda: eng.session_file("import", path)))
         except SessionRefused as e:
             body = error(e.status, str(e))
             body[1]["error"]["kind"] = e.kind
             return body
         except ValueError as e:
             return error(400, str(e))
+        if r is None:
+            return error(503, "the model is not loaded")
         return 200, {"id_slot": 0, "filename": filename, "n_imported": r["tokens"], "n_read": r["bytes"],
                      "timings": {"import_ms": r["ms"]}}
 

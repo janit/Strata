@@ -588,7 +588,14 @@ private:
             std::swap(buf_, spare_);
             pending_n_ = used_;
             pending_total_ = total_;
-            pending_ = std::thread([this] { pending_ok_ = f_.write_all(spare_.get(), pending_n_); });
+            try {
+                pending_ = std::thread([this] { pending_ok_ = f_.write_all(spare_.get(), pending_n_); });
+            } catch (const std::system_error&) {       // no thread to be had: this block is written here instead
+                used_ = 0;
+                if (!f_.write_all(spare_.get(), pending_n_)) return false;
+                if (progress) (*progress)(pending_total_, expected);
+                return true;
+            }
             used_ = 0;
             return true;
         }
@@ -655,7 +662,10 @@ private:
         return (long long) have;
     }
     void read_ahead() {
-        ahead_ = std::thread([this] { ahead_n_ = read_block(spare_.get()); });
+        try {
+            ahead_ = std::thread([this] { ahead_n_ = read_block(spare_.get()); });
+        } catch (const std::system_error&) {           // no thread to be had: fill() reads the next block itself
+        }
     }
     bool fill() {
         at_ = have_ = 0;

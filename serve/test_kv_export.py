@@ -36,8 +36,10 @@ class FakeProc:
         self.sent.append(s.strip())
         cmd, _, rest = s.strip().partition(" ")
         e = self.engine
+        if e.during:                                # what the server allows while the engine works on this line
+            e.during()
         if e.refuse:
-            e.lines.put(f"SERR invalid 0 {e.refuse}\n")
+            e.lines.put(f"SERR {e.refuse_kind} 0 {e.refuse}\n")
         elif cmd == "SAVEX":
             slot, n, h, base, path = rest.split(" ", 4)
             Path(path).write_bytes(b"s" * 100)
@@ -63,6 +65,8 @@ class FakeEngine(StrataEngine):
         self.ended = False
         self.lines = queue.Queue()
         self.refuse = None
+        self.refuse_kind = "invalid"
+        self.during = None
         self.next_id = "00000000000000bb"
         self.silence_s = 30.0
         self.proc = FakeProc(self)
@@ -96,7 +100,9 @@ class Helpers(unittest.TestCase):
         self.assertIsNone(kv_session_id({}))
         self.assertIsNone(kv_session_id({"X-Session-Id": "has space"}))
         self.assertIsNone(kv_session_id({"X-Session-Id": "ünï"}))
-        self.assertEqual(len(kv_session_id({"X-Session-Id": "x" * 999})), 256)
+        # at most 256 bytes, never cut short (two long ids that start alike would share one remembered prompt)
+        self.assertEqual(len(kv_session_id({"X-Session-Id": "x" * 256})), 256)
+        self.assertIsNone(kv_session_id({"X-Session-Id": "x" * 257}))
 
     def test_ids_hash_matches_the_engine(self):
         # the same vector is pinned in src/core/conversation_file_test.cpp (session_ids_fnv1a64)
@@ -123,6 +129,8 @@ class KvExport(unittest.TestCase):
     def setUp(self):
         self.engine.solo()
         self.engine.refuse = None
+        self.engine.refuse_kind = "invalid"
+        self.engine.during = None
         self.engine.proc = FakeProc(self.engine)
         self.svc.__dict__.pop("kv_sessions", None)
         self.svc.__dict__.pop("kv_sessions_bytes", None)
@@ -221,12 +229,71 @@ class KvExport(unittest.TestCase):
         self.engine.refuse = "the batch slot is decoding"
         self.assertEqual(self.save()[0], 409)
 
-    def test_other_refusals_keep_their_status(self):
+    def test_state_refusals_are_409_and_others_keep_their_status(self):
+        # a well-formed save is refused ("invalid") only for the state of that conversation
         self.svc.kv_note("s1", [1])
-        self.engine.refuse = "no complete session to save"
+        for why in ("no complete session to save", "the batch slot's conversation has pictures"):
+            self.engine.refuse = why
+            code, body = self.save()
+            self.assertEqual(code, 409, why)
+            self.assertEqual(body["error"]["kind"], "invalid")
+        self.engine.refuse, self.engine.refuse_kind = "no space left on device", "storage"
         code, body = self.save()
-        self.assertEqual(code, 400)
-        self.assertEqual(body["error"]["kind"], "invalid")
+        self.assertEqual(code, 507)
+        self.assertEqual(body["error"]["kind"], "storage")
+
+    def test_an_unload_waits_for_a_save_or_an_import(self):
+        # parallel requests do not hold the FIFO, but unload() takes it: a save or an import must hold it too, or an
+        # idle unload could end the engine in the middle of one
+        Path(self.dir.name, "in.bin").write_bytes(b"f")
+        for parallel in (0, 2):
+            if parallel:
+                self.engine.parallel(parallel)
+            seen = []
+            self.engine.during = lambda: seen.append(self.svc.unload())
+            self.svc.kv_note("s1", [1, 2, 3])
+            self.assertEqual(self.save()[0], 200)
+            self.assertEqual(self.post("/slots/0?action=import", {"filename": "in.bin"})[0], 200)
+            self.assertEqual(seen, ["busy", "busy"], parallel)
+            with self.svc.status_lock:
+                self.assertEqual(self.svc.status["queued"], 0)
+                self.assertFalse(self.svc.status.get("busy"))
+            self.assertFalse(self.svc.fifo.locked())
+
+    def test_a_save_or_an_import_counts_as_activity_for_the_idle_unload(self):
+        Path(self.dir.name, "in.bin").write_bytes(b"f")
+        self.engine.parallel(2)
+        self.svc.kv_note("s1", [1])
+        for call in (lambda: self.save(), lambda: self.post("/slots/0?action=import", {"filename": "in.bin"})):
+            self.svc.last_request_at = 0.0
+            self.assertEqual(call()[0], 200)
+            self.assertGreater(self.svc.last_request_at, 0.0)
+
+    def test_session_save_reclaim_retries_a_save_by_session(self):
+        # --session-save-reclaim: an unpublished RAM refusal is tried again, with the same SAVEX line
+        from unittest import mock
+        self.svc.kv_note("s1", [1, 2])
+        tries = []
+
+        def during():
+            tries.append(1)
+            if len(tries) == 1:
+                self.engine.refuse, self.engine.refuse_kind = ("not enough RAM to save the session (10 MiB plus a "
+                                                               "floor of 10 MiB needed, 5 available)"), "memory"
+            else:
+                self.engine.refuse = None
+        self.engine.during = during
+        self.engine.session_save_reclaim = True
+        try:
+            with mock.patch("serve.session_save_retry.available_mib", return_value=1 << 20), \
+                    mock.patch("serve.session_save_retry.POLL_SECONDS", 0.01):
+                code, body = self.save()
+        finally:
+            del self.engine.session_save_reclaim
+        self.assertEqual(code, 200, body)
+        self.assertEqual(len(tries), 2)
+        self.assertEqual(len(set(self.engine.proc.sent)), 1)
+        self.assertTrue(self.engine.proc.sent[0].startswith("SAVEX -1 2 "))
 
     def test_session_endpoint_only_saves_and_checks_the_name(self):
         self.svc.kv_note("s1", [1])
