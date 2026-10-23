@@ -133,6 +133,19 @@ batch backend and a parked conversation.
 | batch backend (parallel 2) | 1.0 GB, 0.63 s | 244 MB, 0.26 s |
 | parked conversation | 1.0 GB, 0.64 s | 244 MB, 0.19 s |
 
+## Where the files go
+
+Session and delta files are a cache: a lost file costs one cold prefill (about 40 s at 50k tokens on
+an RTX A4000), never a wrong answer. Durability does not matter; write endurance and write speed
+do. A serving host writes a delta of about 240 MB every turn of a long session, and the host that
+keeps the replica writes as much again. A full save on teddy is bound by its disk (1.2 GB/s), and
+every slot of the engine waits while it runs.
+
+Put `slot_save_path` (and viiwork's `kv_share.dir`) on their own drive, not the system disk.
+Prefer Intel Optane, rated for 30–100 drive writes a day. Use the same mount path on every host
+of a group. About 1 GB per 50k-token conversation, so even a 280 GB drive holds a few hundred.
+tmpfs measured slower than ext4 with O_DIRECT (1.12 vs 0.68 s for a full save).
+
 ## Server memory
 
 The server remembers the prompt of each session's last request so that it can find the
