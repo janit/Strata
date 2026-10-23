@@ -71,6 +71,9 @@ FROM ${RUNTIME_BASE} AS terminal
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates git && rm -rf /var/lib/apt/lists/*
 COPY . /src/
+# the sources have no .git here (.dockerignore): pass --build-arg STRATA_COMMIT=$(git rev-parse HEAD), as docker/build.sh does
+ARG STRATA_COMMIT=
+ENV STRATA_BUILD_COMMIT=${STRATA_COMMIT}
 RUN python3 /src/packaging/package_terminal.py --out /out --cache /cache \
  && mkdir -p /opt/strata \
  && tar -xzf /out/strata-terminal-*-linux-x86_64.tar.gz -C /opt/strata \
