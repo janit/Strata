@@ -30,6 +30,9 @@ WORKDIR /src
 COPY . .
 ARG CUDA_ARCHITECTURES="75;80;86;89;120"
 ARG BUILD_VISION=1
+# 1: also build strata-dsv41 (the DeepSeek-V4.1 engine) and ship it beside `strata`, where setup.py's dsv41_exe() looks
+ARG BUILD_DSV41=1
+ARG STRATA_COMMIT=
 ARG ENGINE_VERSION=
 RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir -r requirements.txt -r requirements-build.txt
 # llama.cpp at the pinned commit (ggml for the engine, mtmd for pictures), exactly as setup.py fetches it
@@ -43,6 +46,13 @@ RUN set -e; \
         -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
         "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" -DSTRATA_GGML_DIR=/src/third_party/llama.cpp; \
     /venv/bin/cmake --build build --target strata strata_kq -j "$(nproc)"; \
+    if [ "$BUILD_DSV41" = "1" ]; then \
+      /venv/bin/cmake -G Ninja -S . -B build-dsv41 -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
+          -DSTRATA_BUILD_DSV41=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" \
+          -DSTRATA_GGML_DIR=/src/third_party/llama.cpp -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON '-DCMAKE_INSTALL_RPATH=$ORIGIN' \
+          "-DSTRATA_BUILD_ID=$(echo "$STRATA_COMMIT" | cut -c1-9)"; \
+      /venv/bin/cmake --build build-dsv41 --target strata-dsv41 -j "$(nproc)"; \
+    fi; \
     if [ "$BUILD_VISION" = "1" ]; then \
       /venv/bin/cmake -G Ninja -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=/src/third_party/llama.cpp \
           -DSTRATA_VISION_CUDA=ON -DSTRATA_PORTABLE=ON -DGGML_CUDA_NCCL=OFF "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"; \
@@ -53,12 +63,14 @@ RUN set -e; \
     cp build/strata /stage/; \
     [ -f build/libstrata_kq.so ] && cp build/libstrata_kq.so /stage/ || true; \
     [ -f build-vision/bin/strata-vision ] && cp build-vision/bin/strata-vision /stage/ || true; \
+    [ -f build-dsv41/strata-dsv41 ] && cp build-dsv41/strata-dsv41 /stage/ || true; \
     ver="${ENGINE_VERSION:-$(sed -n 's/^[[:space:]]*project([^)]*VERSION[[:space:]]*\([0-9][0-9.]*\).*/\1/p' CMakeLists.txt | head -1)}"; \
     cudafull=$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1); cudamajor=${cudafull%%.*}; \
     if [ "$cudamajor" = 13 ]; then mindriver=580.65; else mindriver=575.51; fi; \
     vision_archs=""; [ -f /stage/strata-vision ] && vision_archs=", \"vision_archs\": \"$CUDA_ARCHITECTURES\""; \
     echo "{\"version\": \"$ver\", \"source\": \"docker build\", \"archs\": \"$CUDA_ARCHITECTURES\", \"cuda\": \"$cudafull\", \"portable\": true${vision_archs}}" > /stage/BUILD.json; \
     python3 packaging/collect_libs.py --binary build/strata --search /usr/local/cuda/lib64 --out /stage --also 'libcublasLt.so*'; \
+    [ -f /stage/strata-dsv41 ] && python3 packaging/collect_libs.py --binary /stage/strata-dsv41 --search /usr/local/cuda/lib64 --out /stage || true; \
     archs=""; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do archs="$archs --arch sm_$a"; done; \
     last=$(echo "$CUDA_ARCHITECTURES" | tr ';,' '  ' | awk '{print $NF}'); \
     python3 packaging/package_engine.py --src /stage --backend cuda --version "$ver" --out /engine $archs --arch "compute_$last" \
