@@ -4115,7 +4115,7 @@ class Service:
             cancel.set()
         return len(active)
 
-    def slot_action(self, slot: str, action: str, filename, session=None, base=None) -> tuple[int, dict]:
+    def slot_action(self, slot: str, action: str, filename, session=None, base=None, conv=None) -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
         to or from a file in slot_save_path.  -> (HTTP status, body)."""
         def error(code, message):
@@ -4124,7 +4124,7 @@ class Service:
         if not self.slot_save_path or not hasattr(self.engine, "session_file"):
             return error(501, "slot save/restore is disabled (start the server with --slot-save-path DIR)")
         if slot == "session":
-            return self.session_save(action, filename, session, error, base)
+            return self.session_save(action, filename, session, error, base, conv)
         if getattr(self.engine, "batch", 0) and action == "import" and slot == "0":
             return self.session_import_batch(filename, error)
         if getattr(self.engine, "batch", 0):
@@ -4190,14 +4190,14 @@ class Service:
         return 200, {"id_slot": 0, "filename": filename, "n_restored": r["tokens"], "n_read": r["bytes"],
                      "timings": {"restore_ms": r["ms"]}}
 
-    def session_save(self, action, filename, session, error, base=None) -> tuple[int, dict]:
+    def session_save(self, action, filename, session, error, base=None, conv=None) -> tuple[int, dict]:
         """kv-export: POST /slots/session?action=save {"session": ID, "filename": NAME} saves the conversation the
         client session ID last continued (its requests carried X-Session-Id or X-Session-Affinity), wherever it is now:
         the batch slot that holds it, else the live session, else (the engine looks) the conversation cache, where a
         later request of another session parked it.  With parallel requests it takes the control lines like
         an admission.  409 when that conversation is no longer held (another took its slot)."""
         if action == "held":
-            return self.session_held(session, error)
+            return self.session_held(session, error, conv)
         if action != "save":
             return error(400, "/slots/session supports action=save and action=held")
         why = slot_filename_problem(filename)
@@ -4247,18 +4247,28 @@ class Service:
                      "n_written": r["bytes"], "timings": {"save_ms": r["ms"]}, "save_id": r["save_id"],
                      "base": r["base"], "delta": r["base"] is not None}
 
-    def session_held(self, session, error) -> tuple[int, dict]:
+    def session_held(self, session, error, conv=None) -> tuple[int, dict]:
         """kv-export: POST /slots/session?action=held {"session": ID} -> {"session", "n_held"}: how many tokens of
         the conversation client session ID last continued the engine still holds (live, in a batch slot or parked;
         the longest one that starts with that session's last prompt here), 0 when none or when this server never
-        saw the session.  Read only, so a node asks before each turn whether to import its replica: the
-        conversation cache evicts oldest first and says nothing about which.  With parallel requests it takes the
-        control lines between two admissions, as a save does."""
-        with self.status_lock:
-            ids = (self.__dict__.get("kv_sessions") or {}).get(session) if isinstance(session, str) else None
-        if not ids:
-            return 200, {"session": session, "n_held": 0}
-        conv = (len(ids), fnv1a64_ids(ids))
+        saw the session.  With {"n": N, "hash": "<16 hex>"} it asks for the conversation whose first N ids hash to
+        that (fnv1a64_ids) instead - a replica's own ids, which the session's last prompt here may not start: after
+        a compaction elsewhere this server's copy of the session is another branch.  Read only, so a node asks
+        before each turn whether to import its replica: the conversation cache evicts oldest first and says
+        nothing about which.  With parallel requests it takes the control lines between two admissions, as a
+        save does."""
+        n, h = conv if conv else (None, None)
+        if n is not None or h is not None:
+            if (isinstance(n, bool) or not isinstance(n, int) or n <= 0 or not isinstance(h, str) or len(h) != 16 or
+                    not all(c in "0123456789abcdef" for c in h)):
+                return error(400, "n must be a positive token count and hash 16 lowercase hex digits")
+            conv = (n, int(h, 16))
+        else:
+            with self.status_lock:
+                ids = (self.__dict__.get("kv_sessions") or {}).get(session) if isinstance(session, str) else None
+            if not ids:
+                return 200, {"session": session, "n_held": 0}
+            conv = (len(ids), fnv1a64_ids(ids))
 
         def held(eng):
             if not getattr(eng, "batch", 0):
@@ -7071,7 +7081,8 @@ def make_handler(svc: Service):
                     query = parse_qs(self.path.partition("?")[2])
                     try:
                         code, body = svc.slot_action(path[len("/slots/"):], (query.get("action") or [""])[0],
-                                                     req.get("filename"), req.get("session"), req.get("base"))
+                                                     req.get("filename"), req.get("session"), req.get("base"),
+                                                     (req.get("n"), req.get("hash")))
                     except EngineDied as e:                  # EngineSilent included: the engine was ended
                         code, body = 500, {"error": {"code": 500, "message": str(e) + "; the next request starts "
                                                      "the engine again", "type": "server_error"}}
