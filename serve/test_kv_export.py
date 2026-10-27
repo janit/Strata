@@ -45,6 +45,9 @@ class FakeProc:
             Path(path).write_bytes(b"s" * 100)
             # the engine knows base 00000000000000aa only: a delta against it, else a full save
             e.lines.put(f"SAVEDX {n} 100 12.5 {e.next_id} {base if base == '00000000000000aa' else '0' * 16}\n")
+        elif cmd == "HELD":
+            n, h = rest.split(" ")
+            e.lines.put(f"HELD {e.held.get((int(n), h), 0)}\n")
         elif cmd == "IMPORT":
             e.lines.put("IMPORTED 50000 1000 1500.0\n")
         elif cmd == "SAVE":
@@ -68,6 +71,7 @@ class FakeEngine(StrataEngine):
         self.refuse_kind = "invalid"
         self.during = None
         self.next_id = "00000000000000bb"
+        self.held = {}                              # HELD: (n, hash hex) -> tokens the engine says it holds
         self.silence_s = 30.0
         self.proc = FakeProc(self)
         self.solo()
@@ -301,6 +305,42 @@ class KvExport(unittest.TestCase):
         for bad in ("../x.bin", "a/b.bin", "", None):
             self.assertEqual(self.save(filename=bad)[0], 400, bad)
         self.assertEqual(self.engine.proc.sent, [])
+
+    def held(self, session="s1"):
+        return self.post("/slots/session?action=held", {"session": session})
+
+    def test_held_asks_the_engine_by_the_sessions_last_prompt(self):
+        self.svc.kv_note("s1", [5, 6, 7])
+        h = f"{fnv1a64_ids([5, 6, 7]):016x}"
+        self.engine.held[(3, h)] = 50000
+        code, body = self.held()
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body, {"session": "s1", "n_held": 50000})
+        self.assertEqual(self.engine.proc.sent, [f"HELD 3 {h}"])
+        self.engine.held.clear()                        # evicted
+        self.assertEqual(self.held()[1]["n_held"], 0)
+        self.assertFalse(self.svc.status["busy"], "a check is not work")
+
+    def test_held_of_a_session_never_seen_is_0_and_reaches_no_engine(self):
+        self.assertEqual(self.held("nobody"), (200, {"session": "nobody", "n_held": 0}))
+        self.assertEqual(self.held(7)[1]["n_held"], 0)
+        self.assertEqual(self.engine.proc.sent, [])
+
+    def test_held_with_parallel_requests_takes_and_gives_back_the_lines(self):
+        e = self.engine
+        e.parallel(2)
+        self.svc.kv_note("s1", [1, 2])
+        e.held[(2, f"{fnv1a64_ids([1, 2]):016x}")] = 9
+        self.assertEqual(self.held(), (200, {"session": "s1", "n_held": 9}))
+        self.assertFalse(e.ctl.locked(), "the control lines are given back")
+
+    def test_held_answer_out_of_step_ends_the_engine(self):
+        self.svc.kv_note("s1", [1])
+        self.engine.proc.write = lambda s: self.engine.lines.put("HELD x\n")
+        code, _ = self.held()
+        self.assertEqual(code, 500)
+        self.assertTrue(self.engine.ended)
+        self.engine.ended = False
 
     def test_parallel_save_takes_the_idle_slot_holding_the_conversation(self):
         e = self.engine

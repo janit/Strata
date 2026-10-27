@@ -12201,6 +12201,34 @@ int main(int argc, char** argv) {
             // kv-export: SAVEX <slot|-1> <n> <hash> <base> <path> is SAVEC that also remembers what it wrote and, given
             // the id of an earlier SAVEX of the same conversation (<base>, 16 hex digits; 0: none), writes a delta file
             // (STRSDLT) against it when it can.  Answers SAVEDX <tokens> <bytes> <ms> <id> <base|0>.
+            // kv-export: HELD <n> <hash> asks whether the engine still holds a conversation whose first <n> tokens
+            // hash to <hash>, named as SAVEC names one: the live session, a batch slot (idle or decoding) or a parked
+            // conversation.  Answers HELD <tokens>, the longest such conversation's length (0: none).  Read only:
+            // nothing is moved, saved or touched, so a node can ask before every turn whether an IMPORT is needed.
+            if (line.rfind("HELD ", 0) == 0) {
+                long long held_n = 0;
+                unsigned long long held_hash = 0;
+                if (std::sscanf(line.c_str() + 5, "%lld %llx", &held_n, &held_hash) != 2 || held_n <= 0) {
+                    std::printf("SERR invalid 0 expected: HELD <n> <hash>\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                auto names = [&](const std::vector<int32_t>& ids) {
+                    return (size_t) held_n <= ids.size() &&
+                           strata::core::session_ids_fnv1a64(ids.data(), (size_t) held_n) == held_hash;
+                };
+                size_t held = 0;
+                if (live_ok && live.size() > held && names(live)) held = live.size();
+                for (const BSlot& sl : bs)
+                    if (sl.cached && !sl.partial && !sl.tainted && sl.ids.size() > held && names(sl.ids)) held = sl.ids.size();
+                for (size_t i = 0; i < conversations.size(); ++i) {
+                    const auto& e = conversations.at(i);
+                    if (e.live.ids.size() > held && names(e.live.ids)) held = e.live.ids.size();
+                }
+                std::printf("HELD %zu\n", held);
+                std::fflush(stdout);
+                continue;
+            }
             const bool savex = line.rfind("SAVEX ", 0) == 0;
             const bool savec = line.rfind("SAVEC ", 0) == 0 || savex;
             if (line.rfind("SAVE ", 0) == 0 || savec || line.rfind("RESTORE ", 0) == 0 || line.rfind("IMPORT ", 0) == 0) {

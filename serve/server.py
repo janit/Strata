@@ -2399,16 +2399,20 @@ class StrataEngine:
         a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
         explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
         that never ends is still ended."""
-        if action not in ("save", "restore", "import") or any(c in path for c in "\r\n\0"):
+        if action not in ("save", "restore", "import", "held") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
-        if conv is not None and action != "save":
+        if conv is not None and action not in ("save", "held") or action == "held" and (conv is None or len(conv) != 2):
             raise ValueError("invalid session command")
         # kv-export: `conv` = (where, n, hash): SAVEC saves the conversation whose first n ids hash to `hash`
         # (fnv1a64_ids) from batch slot `where` (or the live session, -1, else a parked one), and the engine refuses
         # if it is no longer held there
         # (where, n, hash, base): SAVEX - the same, remembered by the engine, and a delta file against the earlier
         # SAVEX `base` (0: none) when it can; the answer adds "save_id" and "base" (None: a full session file)
-        if conv is None:
+        # (n, hash) with "held": HELD - the length of the longest conversation the engine still holds (live, a batch
+        # slot or parked) whose first n ids hash to `hash`, 0 for none; read only, `path` unused
+        if action == "held":
+            cmd = f"HELD {int(conv[0])} {int(conv[1]):016x}\n"
+        elif conv is None:
             cmd = f"{action.upper()} {path}\n"
         elif len(conv) == 4:
             cmd = f"SAVEX {int(conv[0])} {int(conv[1])} {int(conv[2]):016x} {int(conv[3]):016x} {path}\n"
@@ -2422,7 +2426,7 @@ class StrataEngine:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
-        want = {"save": "SAVED", "restore": "RESTORED", "import": "IMPORTED"}[action]
+        want = {"save": "SAVED", "restore": "RESTORED", "import": "IMPORTED", "held": "HELD"}[action]
         if conv is not None and len(conv) == 4:
             want = "SAVEDX"
 
@@ -2487,6 +2491,13 @@ class StrataEngine:
                 if len(parts) != 4 or parts[1] not in SessionRefused.STATUS or parts[2] not in ("0", "1"):
                     raise out_of_step(line)
                 raise SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
+            if head == want == "HELD":
+                try:
+                    if len(f) != 2:
+                        raise ValueError
+                    return {"tokens": count(f[1])}
+                except ValueError:
+                    raise out_of_step(line) from None
             if head == want:
                 try:
                     if len(f) != (6 if want == "SAVEDX" else 4):
@@ -4185,8 +4196,10 @@ class Service:
         the batch slot that holds it, else the live session, else (the engine looks) the conversation cache, where a
         later request of another session parked it.  With parallel requests it takes the control lines like
         an admission.  409 when that conversation is no longer held (another took its slot)."""
+        if action == "held":
+            return self.session_held(session, error)
         if action != "save":
-            return error(400, "/slots/session supports action=save")
+            return error(400, "/slots/session supports action=save and action=held")
         why = slot_filename_problem(filename)
         if why:
             return error(400, f"filename {why}")
@@ -4234,6 +4247,33 @@ class Service:
                      "n_written": r["bytes"], "timings": {"save_ms": r["ms"]}, "save_id": r["save_id"],
                      "base": r["base"], "delta": r["base"] is not None}
 
+    def session_held(self, session, error) -> tuple[int, dict]:
+        """kv-export: POST /slots/session?action=held {"session": ID} -> {"session", "n_held"}: how many tokens of
+        the conversation client session ID last continued the engine still holds (live, in a batch slot or parked;
+        the longest one that starts with that session's last prompt here), 0 when none or when this server never
+        saw the session.  Read only, so a node asks before each turn whether to import its replica: the
+        conversation cache evicts oldest first and says nothing about which.  With parallel requests it takes the
+        control lines between two admissions, as a save does."""
+        with self.status_lock:
+            ids = (self.__dict__.get("kv_sessions") or {}).get(session) if isinstance(session, str) else None
+        if not ids:
+            return 200, {"session": session, "n_held": 0}
+        conv = (len(ids), fnv1a64_ids(ids))
+
+        def held(eng):
+            if not getattr(eng, "batch", 0):
+                return eng.session_file("held", "", conv)
+            return self.with_control(lambda: eng.session_file("held", "", conv))
+        try:
+            r = self.session_op("held", held)
+        except SessionRefused as e:
+            body = error(e.status, str(e))
+            body[1]["error"]["kind"] = e.kind
+            return body
+        if r is None:
+            return error(503, "the model is not loaded")
+        return 200, {"session": session, "n_held": r["tokens"]}
+
     def kv_note(self, sid, ids) -> None:
         """kv-export: the conversation client session `sid` continues starts with these ids (the last
         KV_SESSIONS_KEPT sessions, at most KV_SESSIONS_BYTES of ids), for POST /slots/session?action=save."""
@@ -4267,11 +4307,13 @@ class Service:
                 waiting = False
                 if not self.loaded():
                     return None
-                solo = not getattr(self.engine, "batch", 0)
-                if solo:                                    # with parallel requests "busy" is theirs to set
+                # with parallel requests "busy" is theirs to set; a held check is a lookup, not work
+                solo = not getattr(self.engine, "batch", 0) and action != "held"
+                if solo:
                     with self.status_lock:
                         self.status.update(busy=True, phase={"save": "saving the session",
-                                           "import": "importing a session"}[action], started=time.time(),
+                                           "import": "importing a session",
+                                           "held": "checking a session"}[action], started=time.time(),
                                            first_token=None, prompt_tokens=None, generated=None, max_tokens=None)
                 try:
                     return fn(self.engine)

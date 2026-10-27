@@ -51,6 +51,23 @@ POST /slots/0?action=import {"filename": "<name>"}
 - Needs `--conversation-cache-mib` > 0. It works beside `--batch` (parallel requests), where it
   takes the control lines like an admission.
 
+### Asking whether a conversation is still held: `POST /slots/session?action=held`
+
+```
+POST /slots/session?action=held {"session": "<X-Session-Id>"}
+-> 200 {"session", "n_held"}
+```
+
+- `n_held` is the length of the longest conversation the engine still holds that starts with
+  the session's last prompt on this server: the live session, a batch slot or a parked
+  conversation (`HELD <n> <hash>`, named as SAVEC names one). It is 0 when there is none, and
+  when this server never saw the session.
+- Read only: nothing is saved, moved or touched, and the server is not marked busy. With
+  `--batch` it takes the control lines between two admissions, like a save.
+- Why: the conversation cache evicts oldest first and does not say which conversation it
+  evicted. A node that imported a replica earlier asks before the next turn, and imports again
+  when the engine no longer holds the conversation (viiwork, janit/viiwork#1).
+
 `slot_save_path` (or `--slot-save-path`) names the folder for both, as for upstream's
 save/restore. Upstream's `/slots/0?action=save|restore` still refuse parallel requests.
 
