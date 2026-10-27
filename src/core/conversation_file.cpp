@@ -4,6 +4,7 @@
 #include <bit>
 #include <cerrno>
 #include <chrono>
+#include <thread>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +48,10 @@ constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
 constexpr uint32_t kVersion = 1;
 constexpr size_t kHeader = 64, kTrailer = 16;
+// kv-export: delta files (STRSDLT v1): an 80-byte header, the same trailer size
+constexpr char kDeltaMagic[8] = {'S', 'T', 'R', 'S', 'D', 'L', 'T', '\x01'};
+constexpr char kDeltaEnd[8] = {'S', 'T', 'R', 'S', 'D', 'E', 'N', 'D'};
+constexpr size_t kDeltaHeader = 80;
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
 // - the last, partial block included - so a small file reports too, and each report follows real movement.
@@ -527,7 +532,10 @@ bool free_space(const std::string& path, uint64_t& out) {
 
 class FileSink {
 public:
-    explicit FileSink(RawFile& f) : buf_(aligned_block()), f_(f) {}
+    explicit FileSink(RawFile& f, bool write_behind = false) : buf_(aligned_block()), f_(f) {
+        if (write_behind) spare_ = aligned_block();   // none: blocks are written in place, as before
+    }
+    ~FileSink() { if (pending_.joinable()) pending_.join(); }   // a failed write never reached finish()
     bool ok() const { return buf_ != nullptr; }
     std::string error() const {
         if (!buf_) return "out of memory for the write buffer";
@@ -551,6 +559,7 @@ public:
     }
     // last block padded to the alignment for direct I/O, then the file cut back to its exact size and flushed
     bool finish(bool durable) {
+        if (!settle()) { f_.close(); return false; }
         if (!f_.is_open()) return false;
         if (fault_) { f_.close(); return false; }
         const size_t padded = f_.direct() ? (used_ + kAlign - 1) / kAlign * kAlign : used_;
@@ -572,12 +581,42 @@ private:
     void fail_with(int e) { fault_ = true; fault_kind_ = errno_kind(e); fault_msg_ = std::strerror(e); }
     bool drain() {
         if (write_fault) { fail_with(write_fault); return false; }
+        if (spare_) {
+            // write-behind: the full block goes to the writer thread; the previous one must have landed first (one
+            // write in flight, in file order)
+            if (!settle()) return false;
+            std::swap(buf_, spare_);
+            pending_n_ = used_;
+            pending_total_ = total_;
+            try {
+                pending_ = std::thread([this] { pending_ok_ = f_.write_all(spare_.get(), pending_n_); });
+            } catch (const std::system_error&) {       // no thread to be had: this block is written here instead
+                used_ = 0;
+                if (!f_.write_all(spare_.get(), pending_n_)) return false;
+                if (progress) (*progress)(pending_total_, expected);
+                return true;
+            }
+            used_ = 0;
+            return true;
+        }
         if (!f_.write_all(buf_.get(), used_)) return false;
         used_ = 0;
         if (progress) (*progress)(total_, expected);
         return true;
     }
-    Aligned buf_;
+    // the block in flight has landed (or there is none); its progress is reported here, on the caller's thread
+    bool settle() {
+        if (!pending_.joinable()) return true;
+        pending_.join();
+        if (!pending_ok_) return false;
+        if (progress) (*progress)(pending_total_, expected);
+        return true;
+    }
+    Aligned buf_, spare_;
+    std::thread pending_;
+    bool pending_ok_ = true;
+    size_t pending_n_ = 0;
+    uint64_t pending_total_ = 0;
     RawFile& f_;
     bool fault_ = false;
     SessionError fault_kind_ = SessionError::io;
@@ -588,7 +627,12 @@ private:
 
 class FileSource {
 public:
-    explicit FileSource(RawFile& f) : buf_(aligned_block()), f_(f) {}
+    // kv-export: read_ahead - a reader thread fills the next 16 MiB block while the caller parses (copies and hashes)
+    // the current one; off when the second block cannot be allocated
+    explicit FileSource(RawFile& f, bool read_ahead = true) : buf_(aligned_block()), f_(f) {
+        if (read_ahead) spare_ = aligned_block();
+    }
+    ~FileSource() { if (ahead_.joinable()) ahead_.join(); }   // a refused parse stops before the end
     bool ok() const { return buf_ != nullptr; }
     std::string error() const { return buf_ ? f_.error() : std::string("out of memory for the read buffer"); }
     SessionError kind() const { return buf_ ? f_.kind() : SessionError::memory; }
@@ -605,22 +649,50 @@ public:
     std::optional<Ticker> progress;
     uint64_t expected = 0;
 private:
+    // one block into dst: its bytes (0 at the end of the file), -1 on an error
+    long long read_block(uint8_t* dst) {
+        size_t have = 0;
+        while (have < kBlock) {
+            const long long r = f_.read_some(dst + have, kBlock - have);
+            if (r < 0) return -1;
+            if (r == 0) break;
+            have += (size_t) r;
+            if (f_.direct() && have % kAlign) break;   // short aligned read: end of file
+        }
+        return (long long) have;
+    }
+    void read_ahead() {
+        try {
+            ahead_ = std::thread([this] { ahead_n_ = read_block(spare_.get()); });
+        } catch (const std::system_error&) {           // no thread to be had: fill() reads the next block itself
+        }
+    }
     bool fill() {
         at_ = have_ = 0;
-        while (have_ < kBlock) {
-            const long long r = f_.read_some(buf_.get() + have_, kBlock - have_);
-            if (r < 0) return false;
-            if (r == 0) break;
-            have_ += (size_t) r;
-            if (f_.direct() && have_ % kAlign) break;   // short aligned read: end of file
+        long long n;
+        if (!spare_) {
+            n = read_block(buf_.get());
+        } else {
+            if (!ahead_.joinable()) {                  // the first block: read here, the next one ahead
+                n = read_block(buf_.get());
+            } else {
+                ahead_.join();
+                std::swap(buf_, spare_);
+                n = ahead_n_;
+            }
+            if (n == (long long) kBlock) read_ahead(); // a whole block: there may be more
         }
+        if (n < 0) return false;
+        have_ = (size_t) n;
         const uint64_t before = total_;
         total_ += have_;
         if (progress && total_ > before) (*progress)(total_, expected);
         return have_ > 0;
     }
-    Aligned buf_;
+    Aligned buf_, spare_;
     RawFile& f_;
+    std::thread ahead_;
+    long long ahead_n_ = 0;
     size_t at_ = 0, have_ = 0;
     uint64_t total_ = 0;
 };
@@ -639,8 +711,14 @@ struct Out {
         count(c);
         if (!f || !ok || !c) return;
         if (hash) hash->update(p, c);
+        const auto t = std::chrono::steady_clock::now();
         ok = f->write(p, c);
+        disk_ms += since(t);
     }
+    static double since(std::chrono::steady_clock::time_point t) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+    }
+    double source_ms = 0, disk_ms = 0;   // kv-export: where a streamed write's time goes
     void u64(uint64_t v) { raw(&v, 8); }
     void i64(int64_t v) { raw(&v, 8); }
     template<class T> void vec(const std::vector<T>& v) { u64(v.size()); raw(v.data(), v.size() * sizeof(T)); }
@@ -648,26 +726,67 @@ struct Out {
         u64(b.size());
         b.visit(0, b.size(), [&](const uint8_t* p, size_t c, size_t) { raw(p, c); return ok; });
     }
-    // a K/V part pulled from its owner straight into the file block (sizing pass: counted, never read)
+    // kv-export: chunk hashes out, and the delta being written (layer: the K/V layer being written)
+    SessionKvChunks* chunks = nullptr;
+    const SessionDelta* delta = nullptr;
+    size_t layer = 0;
+    // a K/V part pulled from its owner straight into the file block (sizing pass: counted, never read).  A delta
+    // writes (size, keep, the bytes from keep on, the chunk hashes); chunk hashes are computed as the bytes pass.
     void source(const SessionKvSource& s, size_t part) {
         const size_t size = s.sizes[part];
+        const size_t keep = delta ? (size_t) delta->keep[layer][part] : 0;
+        const size_t n_chunks = (size_t) ((size + kSessionChunk - 1) / kSessionChunk);
         u64(size);
-        if (!f) { count(size); return; }
-        for (size_t at = 0; at < size && ok;) {
+        if (delta) u64(keep);
+        std::vector<uint64_t> hashes;
+        const bool hashing = f && (chunks || delta);
+        if (hashing) {
+            hashes.reserve(n_chunks);
+            if (keep) hashes.assign(delta->base_chunks->at(layer)[part].begin(),
+                                    delta->base_chunks->at(layer)[part].begin() + (ptrdiff_t) (keep / kSessionChunk));
+        }
+        SessionHasher piece(0);
+        size_t in_piece = 0;
+        auto chunk_bytes = [&](const uint8_t* p, size_t c) {
+            while (c) {
+                const size_t t = std::min<size_t>(c, kSessionChunk - in_piece);
+                piece.update(p, t);
+                in_piece += t; p += t; c -= t;
+                if (in_piece == kSessionChunk) { hashes.push_back(piece.digest()); piece = SessionHasher(0); in_piece = 0; }
+            }
+        };
+        if (!f) count(size - keep);
+        for (size_t at = keep; f && at < size && ok;) {
             size_t room = 0;
             uint8_t* d = f->span(room);
             const size_t c = std::min(room, size - at);
-            if (!s.read || !s.read(part, at, d, c)) {
+            const auto t = std::chrono::steady_clock::now();
+            const bool got = s.read && s.read(part, at, d, c);
+            source_ms += since(t);
+            if (!got) {
                 ok = false;
                 read_failed = true;
                 if (s.error) read_error = s.error();
                 return;
             }
             if (hash) hash->update(d, c);
+            if (hashing) chunk_bytes(d, c);
             count(c);
+            const auto t2 = std::chrono::steady_clock::now();
             ok = ok && f->commit(c);
+            disk_ms += since(t2);
             at += c;
         }
+        if (hashing && ok && in_piece) hashes.push_back(piece.digest());
+        if (delta) {
+            u64(n_chunks);
+            if (!f) count(n_chunks * 8);
+            else if (ok) {
+                if (hashes.size() != n_chunks) { ok = false; read_failed = true; read_error = "chunk hash count"; return; }
+                raw(hashes.data(), hashes.size() * 8);
+            }
+        }
+        if (hashing && ok && chunks) (*chunks)[layer][part] = std::move(hashes);
     }
     bool read_failed = false;
     std::string read_error;
@@ -686,15 +805,28 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
     o.u64(c.used);
 }
 
-void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
+void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr,
+                 bool deepest_only = false, const std::vector<const ConversationCheckpoint*>* checks = nullptr) {
     for (int64_t g : s.geometry) o.i64(g);
     o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
     put_checkpoint(o, s.live);
-    o.u64(s.checkpoints.size());
-    for (const auto& c : s.checkpoints) put_checkpoint(o, c);
+    if (checks) {
+        o.u64(checks->size());
+        for (const ConversationCheckpoint* c : *checks) put_checkpoint(o, *c);
+    } else if (deepest_only) {   // kv-export: a parked image keeps its chain; the file keeps what a save keeps
+        const ConversationCheckpoint* d = session_deepest_checkpoint(s.checkpoints);
+        o.u64(d ? 1 : 0);
+        if (d) put_checkpoint(o, *d);
+    } else {
+        o.u64(s.checkpoints.size());
+        for (const auto& c : s.checkpoints) put_checkpoint(o, c);
+    }
     if (sources) {
         o.u64(sources->size());
-        for (const auto& k : *sources) {
+        if (o.chunks) o.chunks->assign(sources->size(), {});
+        for (size_t j = 0; j < sources->size(); ++j) {
+            const auto& k = (*sources)[j];
+            o.layer = j;
             put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
             for (size_t part = 0; part < 5; ++part) o.source(k, part);
         }
@@ -815,6 +947,65 @@ void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
     const uint64_t hh = session_hash64(h, 56, 0);
     std::memcpy(h + 56, &hh, 8);
 }
+
+// kv-export: the 80-byte STRSDLT v1 header
+void delta_header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload, const SessionDelta& d,
+                        uint64_t full_size) {
+    std::memset(h, 0, kDeltaHeader);
+    std::memcpy(h, kDeltaMagic, 8);
+    const uint32_t version = 1, size = kDeltaHeader;
+    std::memcpy(h + 8, &version, 4);
+    std::memcpy(h + 12, &size, 4);
+    std::memcpy(h + 16, &id.model, 8);
+    std::memcpy(h + 24, &id.config, 8);
+    std::memcpy(h + 32, &payload, 8);
+    std::memcpy(h + 40, &d.base, 8);
+    std::memcpy(h + 48, &d.id, 8);
+    std::memcpy(h + 56, &full_size, 8);
+    const uint64_t hh = session_hash64(h, 72, 0);
+    std::memcpy(h + 72, &hh, 8);
+}
+
+// kv-export: an image's own K/V as sources, so a host image can be hashed in chunks or written as a delta
+std::vector<SessionKvSource> image_sources(const SavedConversation& image) {
+    std::vector<SessionKvSource> out;
+    for (const auto& k : image.kv) {
+        SessionKvSource s;
+        s.format = k.format; s.cells = k.cells; s.heads = k.heads; s.head_dim = k.head_dim;
+        s.page_size = k.page_size; s.pooled_rows = k.pooled_rows; s.idx_dim = k.idx_dim;
+        const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
+        for (size_t i = 0; i < 5; ++i) s.sizes[i] = parts[i]->size();
+        s.read = [parts](size_t part, size_t offset, void* dst, size_t n) {
+            if (part >= 5 || offset > parts[part]->size() || n > parts[part]->size() - offset) return false;
+            uint8_t* d = static_cast<uint8_t*>(dst);
+            return parts[part]->visit(offset, n, [&](const uint8_t* p, size_t c, size_t at) {
+                std::memcpy(d + (at - offset), p, c);
+                return true;
+            });
+        };
+        s.error = [] { return std::string("K/V read out of range"); };
+        out.push_back(std::move(s));
+    }
+    return out;
+}
+
+// kv-export: a delta's keep values against its sources: whole chunks, within the part and the base's chunks
+bool delta_valid(const SessionDelta& d, const std::vector<SessionKvSource>& kv, std::string& error) {
+    if (!d.id || !d.base_chunks || d.keep.size() != kv.size() || d.base_chunks->size() != kv.size()) {
+        error = "session file: the delta does not describe these K/V layers";
+        return false;
+    }
+    for (size_t j = 0; j < kv.size(); ++j)
+        for (size_t p = 0; p < 5; ++p) {
+            const uint64_t keep = d.keep[j][p];
+            if (keep % kSessionChunk || keep > kv[j].sizes[p] || keep / kSessionChunk > (*d.base_chunks)[j][p].size()) {
+                error = "session file: delta keep " + std::to_string(keep) + " of layer " + std::to_string(j) +
+                        " part " + std::to_string(p) + " is not whole chunks of both the part and the base";
+                return false;
+            }
+        }
+    return true;
+}
 } // namespace
 
 SessionHasher::SessionHasher(uint64_t seed)
@@ -848,6 +1039,15 @@ uint64_t SessionHasher::digest() const {
     for (; i + 8 <= npending_; i += 8) { h ^= round1(0, load64(pending_ + i)); h = rotl(h, 27) * P1 + P4; }
     for (; i < npending_; ++i) { h ^= pending_[i] * P5; h = rotl(h, 11) * P1; }
     h ^= h >> 33; h *= P2; h ^= h >> 29; h *= P3; h ^= h >> 32;
+    return h;
+}
+
+uint64_t session_ids_fnv1a64(const int32_t* ids, size_t n) {
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < n; ++i) {
+        const uint32_t v = (uint32_t) ids[i];
+        for (int k = 0; k < 4; ++k) { h ^= (v >> (8 * k)) & 0xff; h *= 1099511628211ULL; }
+    }
     return h;
 }
 
@@ -1026,19 +1226,44 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes) {
 namespace {
 bool write_impl(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
                 const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
-                SessionStatus& st) {
+                SessionStatus& st, bool deepest_only) {
     st = {};
     st.error = SessionError::invalid;   // refusals before any disk access
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
+    const std::vector<const ConversationCheckpoint*>* checks = opt.checkpoints ? &*opt.checkpoints : nullptr;
+    if (checks && (deepest_only || !image.checkpoints.empty())) {
+        error = "session file: checkpoints given both in the image and in the options";
+        return false;
+    }
+    if (checks) for (const auto* c : *checks) if (!c) { error = "session file: a null checkpoint"; return false; }
+    // kv-export: chunk hashes or a delta need the K/V as sources; an image's own K/V becomes sources here
+    std::vector<SessionKvSource> own;
+    if (!sources && (opt.kv_chunks || opt.delta)) {
+        own = image_sources(image);
+        sources = &own;
+    }
+    if (opt.delta && !delta_valid(*opt.delta, *sources, error)) return false;
     Out sizing;
-    put_payload(sizing, image, sources);
+    sizing.delta = opt.delta;
+    put_payload(sizing, image, sources, deepest_only, checks);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
         sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: the state is too large for this build";
         return false;
     }
-    const uint64_t payload = sizing.n, total = kHeader + payload + kTrailer;
+    uint64_t full_size = 0;   // a delta: the session file it rebuilds
+    if (opt.delta) {
+        Out whole;
+        put_payload(whole, image, sources, deepest_only, checks);
+        if (whole.overflow || whole.n > UINT64_MAX - kHeader - kTrailer) {
+            error = "session file: the state is too large for this build";
+            return false;
+        }
+        full_size = kHeader + whole.n + kTrailer;
+    }
+    const size_t header = opt.delta ? kDeltaHeader : kHeader;
+    const uint64_t payload = sizing.n, total = header + payload + kTrailer;
     st.error = SessionError::io;
     if (opt.min_free_bytes) {
         uint64_t avail = 0;
@@ -1059,7 +1284,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
         error = "session file: cannot create a temporary file beside " + path + ": " + error;
         return false;
     }
-    FileSink f(raw);
+    FileSink f(raw, opt.write_behind);
     if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
     if (opt.progress) f.progress.emplace(opt.progress);
     f.phase = opt.phase;
@@ -1068,20 +1293,26 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     const std::function<int(const char*)>* fault = opt.fault ? &opt.fault : nullptr;
     f.write_fault = injected(fault, "write");
     f.flush_fault = injected(fault, "file_flush");
-    uint8_t h[kHeader];
-    header_bytes(h, id, payload);
-    bool ok = f.write(h, kHeader);
+    uint8_t h[kDeltaHeader];
+    if (opt.delta) delta_header_bytes(h, id, payload, *opt.delta, full_size);
+    else header_bytes(h, id, payload);
+    bool ok = f.write(h, header);
     SessionHasher hash(0);
     Out out;
     out.f = &f;
     out.hash = &hash;
-    if (ok) put_payload(out, image, sources);
+    out.chunks = opt.kv_chunks;
+    out.delta = opt.delta;
+    if (ok) put_payload(out, image, sources, deepest_only, checks);
     ok = ok && out.ok && out.n == payload;
     if (ok) {
         const uint64_t ph = hash.digest();
-        ok = f.write(&ph, 8) && f.write(kEnd, 8);
+        ok = f.write(&ph, 8) && f.write(opt.delta ? kDeltaEnd : kEnd, 8);
     }
+    const auto tf = std::chrono::steady_clock::now();
     ok = f.finish(opt.durable) && ok;
+    st.source_ms = out.source_ms;
+    st.disk_ms = out.disk_ms + Out::since(tf);
     std::string why;
     if (!ok) {
         why = out.read_failed ? "K/V source read" + (out.read_error.empty() ? std::string() : ": " + out.read_error)
@@ -1102,11 +1333,11 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
 
 bool write_guarded(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
                    const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
-                   SessionStatus* status) {
+                   SessionStatus* status, bool deepest_only = false) {
     SessionStatus st;
     bool ok = false;
     try {
-        ok = write_impl(path, image, sources, id, bytes, error, opt, st);
+        ok = write_impl(path, image, sources, id, bytes, error, opt, st, deepest_only);
     } catch (const std::bad_alloc&) {
         error = "session file: out of memory while writing " + path;
         st.error = SessionError::memory;
@@ -1168,6 +1399,12 @@ bool session_file_write(const std::string& path, const SavedConversation& meta, 
 bool session_file_write(const std::string& path, const SavedConversation& image, const SessionFileIdentity& id,
                         size_t& bytes, std::string& error, const SessionWriteOptions& options, SessionStatus* status) {
     return write_guarded(path, image, nullptr, id, bytes, error, options, status);
+}
+
+bool session_file_write_parked(const std::string& path, const SavedConversation& image, const SessionFileIdentity& id,
+                               size_t& bytes, std::string& error, const SessionWriteOptions& options,
+                               SessionStatus* status) {
+    return write_guarded(path, image, nullptr, id, bytes, error, options, status, true);
 }
 
 namespace {

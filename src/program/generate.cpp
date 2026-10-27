@@ -141,6 +141,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <random>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -10326,6 +10327,98 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+        // kv-export: incremental saves.  Every SAVEX remembers what it wrote (a lineage: the tokens, the K/V layout and
+        // the chunk hashes of every K/V part), so a later save of the same conversation can write a delta against it.
+        // Kept bytes are the BASE's: a K/V cell before the first token that differs from the base's tokens holds the
+        // same token's key and value (computed by an earlier read: Strata's own retained-K/V reuse keeps such cells the
+        // same way).  Pictures or a control vector change what a token's K/V means, so they always save in full.
+        struct KvGeo {
+            int format = 0;
+            int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, idx_dim = 0;
+            std::array<uint64_t, 5> sizes{};
+            bool operator==(const KvGeo& b) const {   // the per-cell layout; cells and sizes may differ
+                return format == b.format && heads == b.heads && head_dim == b.head_dim && page_size == b.page_size &&
+                       idx_dim == b.idx_dim;
+            }
+        };
+        struct SaveLineage {
+            uint64_t id = 0;
+            std::vector<int32_t> ids;
+            bool cvec = false, pictures = false;
+            std::vector<KvGeo> geo;
+            strata::core::SessionKvChunks chunks;
+        };
+        std::deque<SaveLineage> lineages;   // most recently used last
+        constexpr size_t kLineages = 64;    // at least the last two saves of each of 32 sessions
+        auto new_save_id = [] {
+            static std::mt19937_64 rng{std::random_device{}() ^ ((uint64_t) std::random_device{}() << 32) ^
+                                       (uint64_t) Clock::now().time_since_epoch().count()};
+            uint64_t v = 0;
+            while (!v) v = rng();
+            return v;
+        };
+        auto geo_of_sources = [](const std::vector<strata::core::SessionKvSource>& kv) {
+            std::vector<KvGeo> g;
+            for (const auto& k : kv) g.push_back({k.format, k.cells, k.heads, k.head_dim, k.page_size, k.idx_dim, {
+                k.sizes[0], k.sizes[1], k.sizes[2], k.sizes[3], k.sizes[4]}});
+            return g;
+        };
+        auto geo_of_image = [](const strata::core::SavedConversation& im) {
+            std::vector<KvGeo> g;
+            for (const auto& k : im.kv) g.push_back({k.format, k.cells, k.heads, k.head_dim, k.page_size, k.idx_dim, {
+                k.k.size(), k.v.size(), k.k_scale.size(), k.v_scale.size(), k.pooled.size()}});
+            return g;
+        };
+        // a delta against `base` for this conversation, or nothing (save in full): the bytes of every K/V part that
+        // hold the cells before the first token differing from the base's - whole pages, whole indexer rows, the
+        // draft one cell less (its last cell may not have been computed) - in whole chunks the base has too
+        auto plan_delta = [&](uint64_t base, const std::vector<int32_t>& ids, bool cvec, bool pictures,
+                              const std::vector<KvGeo>& geo, std::optional<strata::core::SessionDelta>& out) {
+            out.reset();
+            if (!base || pictures) return;
+            auto it = std::find_if(lineages.begin(), lineages.end(), [&](const SaveLineage& l) { return l.id == base; });
+            if (it == lineages.end() || it->pictures || it->cvec != cvec || it->geo.size() != geo.size()) return;
+            for (size_t j = 0; j < geo.size(); ++j) if (!(it->geo[j] == geo[j])) return;
+            const size_t common = (size_t) (std::mismatch(ids.begin(), ids.begin() + (ptrdiff_t) std::min(ids.size(), it->ids.size()),
+                                                          it->ids.begin()).first - ids.begin());
+            const int64_t idx_block = strata::kernels::qsa_real_shapes().idx_block;
+            strata::core::SessionDelta d;
+            d.base = base;
+            d.base_chunks = &it->chunks;
+            d.keep.assign(geo.size(), {});
+            for (size_t j = 0; j < geo.size(); ++j) {
+                const bool draft = j + 1 == geo.size();
+                const int64_t u = std::max<int64_t>(0, (int64_t) common - (draft ? 1 : 0));
+                const KvGeo& n = geo[j];
+                for (size_t p = 0; p < 5; ++p) {
+                    uint64_t keep = 0;
+                    if (p < 4) {
+                        const int64_t whole = n.page_size > 0 ? u / n.page_size * n.page_size : 0;
+                        if (n.cells > 0) keep = n.sizes[p] / (uint64_t) n.cells * (uint64_t) whole;
+                    } else if (!draft && idx_block > 0) {
+                        keep = (uint64_t) (u / idx_block) * (uint64_t) n.idx_dim * 4;
+                    }
+                    keep = std::min({keep, n.sizes[p], it->geo[j].sizes[p]});
+                    keep = keep / strata::core::kSessionChunk * strata::core::kSessionChunk;
+                    keep = std::min<uint64_t>(keep, it->chunks[j][p].size() * strata::core::kSessionChunk);
+                    d.keep[j][p] = keep;
+                }
+            }
+            out = std::move(d);
+        };
+        auto remember = [&](uint64_t id, const std::vector<int32_t>& ids, bool cvec, bool pictures,
+                            std::vector<KvGeo>&& geo, strata::core::SessionKvChunks&& chunks) {
+            lineages.push_back({id, ids, cvec, pictures, std::move(geo), std::move(chunks)});
+            while (lineages.size() > kLineages) lineages.pop_front();
+        };
+        auto touch = [&](uint64_t id) {   // a base used again stays (most recently used last)
+            auto it = std::find_if(lineages.begin(), lineages.end(), [&](const SaveLineage& l) { return l.id == id; });
+            if (it != lineages.end() && std::next(it) != lineages.end()) {
+                SaveLineage l = std::move(*it);
+                lineages.erase(it);
+                lineages.push_back(std::move(l));
+            }
+        };
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -13440,14 +13533,79 @@ int main(int argc, char** argv) {
             // (fingerprint file, state capture, file flush, rename + folder flush, validation, device transfer):
             // that step is allowed <seconds> (session_phase_limit_s) by the watchdog and by the server, no more.
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
-            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
+            // kv-export: IMPORT <path> reads a session file like RESTORE but parks it in the conversation cache
+            // instead of replacing the live session, so a conversation replicated from another host waits for its
+            // next turn without evicting this host's own, and the request path restores it as any parked one
+            // (batch slots included).  Answers IMPORTED <tokens> <bytes> <ms>, or SERR as RESTORE does.
+            // kv-export: SAVEC <slot|-1> <n> <hash> <path> saves one conversation by where it is: batch slot <slot>
+            // (idle, still holding it) or the live session (-1), only if its first <n> tokens hash (FNV-1a 64 over
+            // the int32 ids, 16 hex digits) to <hash> - the server names the conversation by the prompt it sent, so
+            // a slot another conversation took meanwhile is refused instead of saved under the wrong name.
+            // kv-export: SAVEX <slot|-1> <n> <hash> <base> <path> is SAVEC that also remembers what it wrote and, given
+            // the id of an earlier SAVEX of the same conversation (<base>, 16 hex digits; 0: none), writes a delta file
+            // (STRSDLT) against it when it can.  Answers SAVEDX <tokens> <bytes> <ms> <id> <base|0>.
+            // kv-export: HELD <n> <hash> asks whether the engine still holds a conversation whose first <n> tokens
+            // hash to <hash>, named as SAVEC names one: the live session, a batch slot (idle or decoding) or a parked
+            // conversation.  Answers HELD <tokens>, the longest such conversation's length (0: none).  Read only:
+            // nothing is moved, saved or touched, so a node can ask before every turn whether an IMPORT is needed.
+            if (line.rfind("HELD ", 0) == 0) {
+                long long held_n = 0;
+                unsigned long long held_hash = 0;
+                if (std::sscanf(line.c_str() + 5, "%lld %llx", &held_n, &held_hash) != 2 || held_n <= 0) {
+                    std::printf("SERR invalid 0 expected: HELD <n> <hash>\n");
+                    std::fflush(stdout);
+                    continue;
+                }
+                auto names = [&](const std::vector<int32_t>& ids) {
+                    return (size_t) held_n <= ids.size() &&
+                           strata::core::session_ids_fnv1a64(ids.data(), (size_t) held_n) == held_hash;
+                };
+                size_t held = 0;
+                if (live_ok && live.size() > held && names(live)) held = live.size();
+                for (const BSlot& sl : bs)
+                    if (sl.cached && !sl.partial && !sl.tainted && sl.ids.size() > held && names(sl.ids)) held = sl.ids.size();
+                for (size_t i = 0; i < conversations.size(); ++i) {
+                    const auto& e = conversations.at(i);
+                    if (e.live.ids.size() > held && names(e.live.ids)) held = e.live.ids.size();
+                }
+                std::printf("HELD %zu\n", held);
+                std::fflush(stdout);
+                continue;
+            }
+            const bool savex = line.rfind("SAVEX ", 0) == 0;
+            const bool savec = line.rfind("SAVEC ", 0) == 0 || savex;
+            if (line.rfind("SAVE ", 0) == 0 || savec || line.rfind("RESTORE ", 0) == 0 || line.rfind("IMPORT ", 0) == 0) {
                 const bool save = line[0] == 'S';
-                const std::string path = line.substr(save ? 5 : 8);
+                const bool import = line[0] == 'I';
+                long long savec_slot = -1, savec_n = 0;
+                unsigned long long savec_hash = 0, savex_base = 0;
+                std::string path;
+                if (savex) {
+                    int used = 0;
+                    if (std::sscanf(line.c_str() + 6, "%lld %lld %llx %llx %n", &savec_slot, &savec_n, &savec_hash,
+                                    &savex_base, &used) != 4 || used <= 0) {
+                        std::printf("SERR invalid 0 expected: SAVEX <slot|-1> <n> <hash> <base> <path>\n");
+                        std::fflush(stdout);
+                        continue;
+                    }
+                    path = line.substr(6 + (size_t) used);
+                } else if (savec) {
+                    int used = 0;
+                    if (std::sscanf(line.c_str() + 6, "%lld %lld %llx %n", &savec_slot, &savec_n, &savec_hash, &used) != 3 ||
+                        used <= 0) {
+                        std::printf("SERR invalid 0 expected: SAVEC <slot|-1> <n> <hash> <path>\n");
+                        std::fflush(stdout);
+                        continue;
+                    }
+                    path = line.substr(6 + (size_t) used);
+                } else {
+                    path = line.substr(save ? 5 : import ? 7 : 8);
+                }
                 const auto t0 = Clock::now();
                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
                                   bool published = false) {
-                    std::fprintf(stderr, "strata serve: session %s %s: %s\n", save ? "save" : "restore", path.c_str(),
+                    std::fprintf(stderr, "strata serve: session %s %s: %s\n", save ? "save" : import ? "import" : "restore", path.c_str(),
                                  why.c_str());
                     std::string one = why;   // one protocol line
                     for (char& c : one) if (c == '\n' || c == '\r') c = ' ';
@@ -13478,7 +13636,11 @@ int main(int argc, char** argv) {
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
-                if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
+                if (o.batch > 0 && !import && !savec) { refuse("session files do not support --batch (parallel requests)"); continue; }
+                if (import && !conversations.enabled()) {
+                    refuse("IMPORT parks the conversation: it needs --conversation-cache-mib > 0");
+                    continue;
+                }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
@@ -13498,9 +13660,98 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 if (save) {
-                    if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
+                    // what is saved: the live session, or (SAVEC) an idle batch slot's
+                    const std::vector<int32_t>* src_ids = &live;
+                    static const std::vector<ImgKey> no_imgs;
+                    const std::vector<ImgKey>* src_imgs = &live_imgs;
+                    const std::vector<ConvCheckpoint>* src_checks = &checks;
+                    bool src_cvec = cvec_cached, src_ok = live_ok;
+                    strata::core::SessionState* src_ss = &ss;
+                    const strata::core::QsaState* src_draft = &mtp.kv_state();
+                    if (savec && savec_slot >= 0) {
+                        if (savec_slot >= (long long) bs.size()) { refuse("no such batch slot"); continue; }
+                        if (!stages.empty()) { refuse("SAVEC of a batch slot does not support --layer-split"); continue; }
+                        const BSlot& sl = bs[(size_t) savec_slot];
+                        if (sl.active) { refuse("the batch slot is decoding"); continue; }
+                        if (!sl.cached || sl.partial || sl.tainted) { refuse("the batch slot holds no complete conversation"); continue; }
+                        if (sl.img) { refuse("the batch slot's conversation has pictures"); continue; }
+                        src_ids = &sl.ids;
+                        src_imgs = &no_imgs;
+                        src_checks = &sl.checks;
+                        src_cvec = sl.cvec;
+                        src_ok = true;
+                        src_ss = bslot_ss[0][(size_t) savec_slot].get();
+                        // the slot's own drafter with --batch-mtp; else the solo drafter's K/V, which was built for
+                        // another conversation: it only proposes drafts (the verifier decides), as when a slot goes
+                        // back to the solo path
+                        if (batch_mtp && (size_t) savec_slot < slot_mtp.size()) src_draft = &slot_mtp[(size_t) savec_slot]->kv_state();
+                    }
+                    if (savec) {
+                        auto names = [&](const std::vector<int32_t>& ids) {
+                            return savec_n > 0 && (size_t) savec_n <= ids.size() &&
+                                   strata::core::session_ids_fnv1a64(ids.data(), (size_t) savec_n) == savec_hash;
+                        };
+                        if (!(src_ok && names(*src_ids))) {
+                            // kv-export: the live session moved on (another conversation's request took it and parked
+                            // this one): save the longest parked conversation it names, straight from RAM.  The file
+                            // is the one a SAVE of it as the live session writes (only the deepest checkpoint).
+                            const strata::core::SavedConversation* parked = nullptr;
+                            for (size_t i = 0; savec_slot < 0 && i < conversations.size(); ++i) {
+                                const auto& e = conversations.at(i);
+                                if (e.stage_images.empty() && e.live.imgs.empty() && names(e.live.ids) &&
+                                    (!parked || e.live.ids.size() > parked->live.ids.size())) parked = &e;
+                            }
+                            if (!parked) { refuse("that conversation is no longer held there"); continue; }
+                            size_t bytes = 0;
+                            strata::core::SessionWriteOptions wo;
+                            wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                            wo.progress = moving;
+                            wo.phase = blocking;
+                            strata::core::SessionStatus st;
+                            std::optional<strata::core::SessionDelta> delta;
+                            strata::core::SessionKvChunks chunks;
+                            std::vector<KvGeo> geo;
+                            const uint64_t new_id = savex ? new_save_id() : 0;
+                            if (savex) {
+                                geo = geo_of_image(*parked);
+                                plan_delta(savex_base, parked->live.ids, parked->cvec, !parked->live.imgs.empty(), geo, delta);
+                                if (delta) { delta->id = new_id; wo.delta = &*delta; }
+                                wo.kv_chunks = &chunks;
+                            }
+                            try {
+                                if (!strata::core::session_file_write_parked(path, *parked, id, bytes, err, wo, &st)) {
+                                    refuse(err, st.error, st.published);
+                                    continue;
+                                }
+                            } catch (const std::bad_alloc&) {
+                                refuse("not enough RAM to save the session", strata::core::SessionError::memory);
+                                continue;
+                            }
+                            std::fprintf(stderr, "strata serve: session saved %zu tokens (parked%s), %zu bytes to %s in "
+                                         "%.1f ms (disk %.1f ms)\n", parked->live.ids.size(), delta ? ", delta" : "", bytes,
+                                         path.c_str(), ms(), st.disk_ms);
+                            if (savex) {
+                                const size_t tokens = parked->live.ids.size();
+                                if (delta) touch(savex_base);
+                                remember(new_id, parked->live.ids, parked->cvec, !parked->live.imgs.empty(), std::move(geo),
+                                         std::move(chunks));
+                                std::printf("SAVEDX %zu %zu %.1f %016llx %016llx\n", tokens, bytes, ms(),
+                                            (unsigned long long) new_id, (unsigned long long) (delta ? savex_base : 0));
+                            } else {
+                                std::printf("SAVED %zu %zu %.1f\n", parked->live.ids.size(), bytes, ms());
+                            }
+                            std::fflush(stdout);
+                            continue;
+                        }
+                    }
+                    if (!src_ok || src_ids->empty()) { refuse("no complete session to save"); continue; }
                     size_t bytes = 0, kept = 0;
-                    double capture_ms = 0;
+                    double capture_ms = 0, checks_ms = 0;   // kv-export: where a save's pause goes
+                    strata::core::SessionStatus save_st;
+                    std::optional<strata::core::SessionDelta> save_delta;   // SAVEX
+                    strata::core::SessionKvChunks save_chunks;
+                    std::vector<KvGeo> save_geo;
+                    uint64_t save_id = 0;
                     try {
                         // RAM PREFLIGHT for the save (not a reservation), BEFORE anything is copied: the deepest
                         // checkpoint is chosen by reference, and the copies it will take (the list below and the one
@@ -13513,18 +13764,18 @@ int main(int argc, char** argv) {
                             strata::core::ConversationStateSizes z;
                             std::string why;
                             uint64_t state = UINT64_MAX;   // unknown sizes: the preflight refuses rather than guesses
-                            if (strata::core::conversation_session_sizes(g, ss, z, why)) {
-                                const uint64_t q = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0);
+                            if (strata::core::conversation_session_sizes(g, *src_ss, z, why)) {
+                                const uint64_t q = (uint64_t) std::max<int64_t>(src_ss->qsa_alloc, 0);
                                 const uint64_t per = (uint64_t) z.tail + z.dead + z.block_pos;
                                 if (q == 0 || per <= (UINT64_MAX - z.gdn - z.ple) / q) state = z.gdn + z.ple + q * per;
                             }
                             sl.state_bytes = state;
-                            sl.tokens = live.size();
-                            sl.images = live_imgs.size();
-                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
+                            sl.tokens = src_ids->size();
+                            sl.images = src_imgs->size();
+                            sl.kv_layers = (uint64_t) std::max<int64_t>(src_ss->qsa_alloc, 0) + 1;
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
-                        if (o.session_save_reclaim) {
+                        if (o.session_save_reclaim && src_ss == &ss) {
                             const auto freed = strata::core::session_save_reclaim(
                                 checks, conversations, sl, floor, strata::core::available_host_bytes);
                             if (freed.bytes || freed.checkpoints || freed.parked) {
@@ -13547,19 +13798,40 @@ int main(int argc, char** argv) {
                                   " MiB needed, " + ram_note(mem) + ")";
                             return false;
                         };
-                        std::vector<ConvCheckpoint> disk_checks;
+                        // kv-export: the deepest checkpoint goes into the file by reference (the chain is not
+                        // touched while the engine writes), so nothing is copied for it: the preflight counts no copy
+                        const ConvCheckpoint* deepest = strata::core::session_deepest_checkpoint(*src_checks);
                         std::string why;
-                        if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why)) {
+                        if (!admit(strata::core::session_save_peak_bytes(nullptr, sl), why)) {
                             refuse(why, strata::core::SessionError::memory);
                             continue;
                         }
-                        kept = disk_checks.size();
-                        const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
+                        // what the view checked for a checkpoint it carried: a prefix of the live tokens and of
+                        // their pictures, one carve's state
+                        auto same_pictures = [&](const ConvCheckpoint& c) {
+                            size_t k = 0;
+                            for (const auto& key : *src_imgs) {
+                                if ((uint64_t) key.start >= c.ids.size()) break;
+                                if (k >= c.imgs.size() || !(c.imgs[k++] == key)) return false;
+                            }
+                            return k == c.imgs.size();
+                        };
+                        if (deepest && (!deepest->stage_parts.empty() || deepest->ids.empty() || !same_pictures(*deepest) ||
+                                        deepest->ids.size() > src_ids->size() ||
+                                        !std::equal(deepest->ids.begin(), deepest->ids.end(), src_ids->begin()) ||
+                                        !strata::core::conversation_checkpoint_validate(*deepest, *src_ss, g, err))) {
+                            refuse(err.empty() ? std::string("the deepest checkpoint is not a live token prefix") : err);
+                            continue;
+                        }
+                        kept = deepest ? 1 : 0;
+                        checks_ms = ms();
+                        static const std::vector<ConvCheckpoint> no_checks;
+                        const strata::core::ConversationView view{*src_ids, *src_imgs, no_checks, src_cvec};
                         strata::core::SavedConversation meta;
                         std::vector<strata::core::SessionKvSource> sources;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
+                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, *src_ss, g, *src_draft,
                                                                          err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -13569,7 +13841,16 @@ int main(int argc, char** argv) {
                         wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
                         wo.progress = moving;
                         wo.phase = blocking;
-                        strata::core::SessionStatus st;
+                        wo.checkpoints.emplace();
+                        if (deepest) wo.checkpoints->push_back(deepest);
+                        if (savex) {
+                            save_geo = geo_of_sources(sources);
+                            plan_delta(savex_base, *src_ids, src_cvec, !src_imgs->empty(), save_geo, save_delta);
+                            save_id = new_save_id();
+                            if (save_delta) { save_delta->id = save_id; wo.delta = &*save_delta; }
+                            wo.kv_chunks = &save_chunks;
+                        }
+                        strata::core::SessionStatus& st = save_st;
                         if (!strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st)) {
                             refuse(err, st.error, st.published);
                             continue;
@@ -13581,10 +13862,20 @@ int main(int argc, char** argv) {
                         refuse("not enough RAM to save the session", strata::core::SessionError::memory);
                         continue;
                     }
-                    std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
-                                 "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
-                                 path.c_str(), ms(), capture_ms);
-                    std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
+                    const double total_ms = ms();
+                    std::fprintf(stderr, "strata serve: session saved %zu tokens%s, %zu of %zu checkpoints, %zu bytes to %s "
+                                 "in %.1f ms (state %.1f ms: checkpoints %.1f, live %.1f; write %.1f ms: K/V reads %.1f, "
+                                 "disk %.1f)\n", src_ids->size(), save_delta ? " (delta)" : "", kept, src_checks->size(), bytes, path.c_str(), total_ms,
+                                 capture_ms, checks_ms, capture_ms - checks_ms, total_ms - capture_ms,
+                                 save_st.source_ms, save_st.disk_ms);
+                    if (savex) {
+                        if (save_delta) touch(savex_base);
+                        remember(save_id, *src_ids, src_cvec, !src_imgs->empty(), std::move(save_geo), std::move(save_chunks));
+                        std::printf("SAVEDX %zu %zu %.1f %016llx %016llx\n", src_ids->size(), bytes, ms(),
+                                    (unsigned long long) save_id, (unsigned long long) (save_delta ? savex_base : 0));
+                    } else {
+                        std::printf("SAVED %zu %zu %.1f\n", src_ids->size(), bytes, ms());
+                    }
                 } else {
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
@@ -13624,6 +13915,26 @@ int main(int argc, char** argv) {
                     blocking("validate", bytes);
                     if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
                         refuse(err);
+                        continue;
+                    }
+                    if (import) {
+                        // host memory only: the device state, the live session and the batch slots are untouched
+                        const size_t tokens = image.live.ids.size(), held = image.bytes();
+                        if (!conversations.wants((int64_t) tokens)) {
+                            refuse("shorter than --conversation-cache-min-tokens");
+                            continue;
+                        }
+                        if (!conversations.put(std::move(image))) {
+                            refuse("no room in the conversation cache (--conversation-cache-mib / -slots)",
+                                   strata::core::SessionError::memory);
+                            continue;
+                        }
+                        std::fprintf(stderr, "strata serve: session imported %zu tokens, %zu bytes (%zu in RAM) from %s "
+                                     "in %.1f ms (read+check %.1f ms); parked=%zu bytes=%zu evictions=%zu\n", tokens,
+                                     bytes, held, path.c_str(), ms(), read_ms, conversations.size(),
+                                     conversations.bytes(), conversations.evictions());
+                        std::printf("IMPORTED %zu %zu %.1f\n", tokens, bytes, ms());
+                        std::fflush(stdout);
                         continue;
                     }
                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells

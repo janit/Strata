@@ -33,6 +33,7 @@ Use the guide for your GPU and operating system. Model and feature support can d
 
 - [Build or run from a source checkout](SOURCE_INSTALL.md)
 - [Docker](DOCKER.md)
+- [Moving a conversation between servers](SESSION_SHARING.md) (session files for a router in front of several servers)
 - [Contribution rules](../CONTRIBUTING.md)
 - [Community benchmarks](COMMUNITY_BENCHMARKS.md) and the [standard benchmark protocol](BENCHMARK_PROTOCOL.md)
 - [How the engine works](HOW_IT_WORKS.md), [technical reference](DETAILS.md) and [Terminal reference](TERMINAL.md)
