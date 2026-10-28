@@ -49,8 +49,15 @@ POST /slots/0?action=import {"filename": "<name>"}
 
 ```
 POST /slots/session?action=held {"session": "<session id>"}
+POST /slots/session?action=held {"session": "<session id>", "n": <tokens>, "hash": "<16 hex>"}
 -> 200 {"session", "n_held"}
 ```
+
+- With `n` and `hash` (FNV-1a 64 over the first `n` token ids as little-endian int32, as `SAVEC` names a conversation)
+  the engine is asked about that conversation rather than the session's: a caller sends the ids of the copy it
+  imported. Without them the server uses the session's last prompt on this server, which after the conversation was
+  compacted on another server is a different branch, so the answer could be "held" for a conversation the next turn
+  cannot use.
 
 - `n_held` is the length of the longest conversation the engine still holds that starts with the session's last
   prompt on this server: the live session, a batch slot or a parked one (`HELD <n> <hash>`). It is 0 when there is none,

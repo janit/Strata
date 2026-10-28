@@ -332,6 +332,18 @@ class KvExport(unittest.TestCase):
         self.assertEqual(self.held()[1]["n_held"], 0)
         self.assertFalse(self.svc.status["busy"], "a check is not work")
 
+    def test_held_by_a_replicas_own_ids(self):
+        self.svc.kv_note("s1", [9, 9])                  # another branch of the session: not what is asked
+        h = f"{fnv1a64_ids([5, 6, 7, 8]):016x}"
+        self.engine.held[(4, h)] = 4000
+        code, body = self.post("/slots/session?action=held", {"session": "s1", "n": 4, "hash": h})
+        self.assertEqual((code, body), (200, {"session": "s1", "n_held": 4000}))
+        self.assertEqual(self.engine.proc.sent, [f"HELD 4 {h}"])
+        # also for a session this server never saw: the ids name the conversation
+        self.assertEqual(self.post("/slots/session?action=held", {"session": "x", "n": 4, "hash": h})[1]["n_held"], 4000)
+        for bad in ({"n": 0, "hash": h}, {"n": "4", "hash": h}, {"n": 4, "hash": "XYZ"}, {"n": 4}, {"hash": h}):
+            self.assertEqual(self.post("/slots/session?action=held", {"session": "s1", **bad})[0], 400, bad)
+
     def test_held_of_a_session_never_seen_is_0_and_reaches_no_engine(self):
         self.assertEqual(self.held("nobody"), (200, {"session": "nobody", "n_held": 0}))
         self.assertEqual(self.held(7)[1]["n_held"], 0)
