@@ -5,6 +5,13 @@ Branch `kv-export-0.2.13` of github.com/janit/Strata, based on Strata v0.2.13.1 
 serving fleet needs to move a conversation between Strata processes on different hosts. Everything
 else behaves exactly as upstream does.
 
+The additions live in files of their own (`include/strata/program/kv_export.hpp`,
+`include/strata/core/session_delta.hpp`, `src/core/session_delta_file.hpp`, `serve/kv_export.py`);
+upstream's files carry only thin hooks marked `kv-export`. Branch `kv-export-hooks` also ships them
+as a patch overlay in `kvx/` (not part of the patch itself): `kvx/build.sh <upstream-tag>` applies
+`kvx/patches/kv-export.patch` to a checkout of any upstream release, runs the tests and builds the
+image. `kvx/README.md` lists every hook site and says what to do when a release conflicts.
+
 A session that spills from its host to another one normally pays a cold prefill there (41 s for 50k
 tokens on one RTX A4000). With these additions, the host that served the turn saves the
 conversation by its client session id. A replica on another host is parked there and continues
