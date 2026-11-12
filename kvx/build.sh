@@ -4,10 +4,12 @@
 #   kvx/build.sh <upstream-tag> [--archs "86;89;120"] [--tag <image>] [--with-dsv41] [--skip-tests]
 #                [--target <stage>] [--build-arg K=V ...] [--no-build]
 #
-#   <upstream-tag>   a tag of upstream Strata (github.com/Niko1221/Strata), e.g. v0.2.13.1; any other ref (main, a
-#                    commit) works too and is fetched from upstream when this host does not have it
+#   <upstream-tag>   a tag of upstream Strata (github.com/Niko1221/Strata), e.g. v0.2.13.1; a commit id (4-40 hex
+#                    digits) works too and is fetched from upstream only when $STRATA_REPO does not have it; any
+#                    other name (main) is always fetched from upstream, so it means upstream's branch, not a local one
 #   --archs          CUDA_ARCHITECTURES for the image (default "86;89;120": A4000/3090, 4090, 5090)
-#   --tag            image name (default strata-cuda:<upstream-tag>-kvx)
+#   --tag            image name (default strata-cuda:<upstream-tag>-kvx, or strata-cuda:<upstream-tag>-kvx-<stage>
+#                    with --target, so a stage never takes the runnable image's name)
 #   --with-dsv41     also apply the optional Dockerfile patch that builds strata-dsv41
 #   --skip-tests     do not run the CPU tests before the build
 #   --target         build only that Dockerfile stage (engine-build is the quick compile check)
@@ -24,7 +26,7 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-usage() { sed -n '2,24p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,/^set /{/^#/p}' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 ref= archs="86;89;120" image= dsv41=0 tests=1 build=1 target=
 extra=()
@@ -44,10 +46,14 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$ref" ] || { usage >&2; exit 2; }
 
+# the ref names a directory below (and the rm -rf of its src/): refuse anything git would not take as a name, and
+# anything whose directory name starts with a dot ("." and ".." among them)
+git check-ref-format --allow-onelevel "$ref" || { echo "build: not a valid tag, branch or commit name: $ref" >&2; exit 2; }
 repo=${STRATA_REPO:-$HOME/strata-fork}
 safe=$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._-' '-')
+case "$safe" in .*|-*) echo "build: refusing the ref $ref (its scratch directory would be $safe)" >&2; exit 2 ;; esac
 scratch=${KVX_SCRATCH:-$HOME/strata-kvx-build}/$safe
-image=${image:-strata-cuda:$safe-kvx}
+image=${image:-strata-cuda:$safe-kvx${target:+-$(printf '%s' "$target" | tr -c 'A-Za-z0-9._-' '-')}}
 src=$scratch/src
 log() { printf '\n== kvx: %s\n' "$*"; }
 
@@ -62,8 +68,10 @@ if git -C "$src" rev-parse -q --verify "refs/tags/$ref^{commit}" >/dev/null; the
     commit=$(git -C "$src" rev-parse "refs/tags/$ref^{commit}")
 elif git -C "$repo" rev-parse -q --verify "refs/tags/$ref^{commit}" >/dev/null; then
     commit=$(git -C "$repo" rev-parse "refs/tags/$ref^{commit}")
+elif printf '%s' "$ref" | grep -qxE '[0-9a-f]{4,40}' && local_commit=$(git -C "$repo" rev-parse -q --verify "$ref^{commit}"); then
+    commit=$local_commit                    # a commit id this host has (the shared clone sees its objects)
 else
-    echo "kvx: $ref is not a tag in $repo; fetching it from $upstream_url"
+    echo "kvx: $ref is not a tag or a commit in $repo; fetching it from $upstream_url"
     if git -C "$src" fetch -q --no-tags "$upstream_url" "refs/tags/$ref:refs/tags/$ref" 2>/dev/null; then
         commit=$(git -C "$src" rev-parse "refs/tags/$ref^{commit}")
     else

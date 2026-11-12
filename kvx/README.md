@@ -38,8 +38,9 @@ plus upstream's `src/core/session_save_reclaim_test.cpp` (119), which the save p
 ```sh
 kvx/build.sh v0.2.14                                # strata-cuda:v0.2.14-kvx, archs 86;89;120
 kvx/build.sh v0.2.14 --with-dsv41 --tag strata-cuda:kvx-0.2.14
-kvx/build.sh v0.2.14 --target engine-build --build-arg BUILD_VISION=0 --tag strata-kvh-check:0.2.14
-                                                    # compile check of the engine only
+kvx/build.sh v0.2.14 --target engine-build --build-arg BUILD_VISION=0
+                                                    # compile check of the engine only:
+                                                    # strata-cuda:v0.2.14-kvx-engine-build
 kvx/build.sh main --no-build                        # does upstream's tip still take the patch and pass?
 kvx/apply.sh ~/some/strata-checkout --check         # report only, change nothing
 ```
@@ -47,7 +48,12 @@ kvx/apply.sh ~/some/strata-checkout --check         # report only, change nothin
 `build.sh` makes a scratch clone under `~/strata-kvx-build/<tag>/src` with `git clone --shared
 ~/strata-fork` (no object is copied; `STRATA_REPO` and `KVX_SCRATCH` override the two paths). A tag
 this host does not have is fetched from `~/strata-fork`'s `origin` remote into the scratch clone
-only, so `~/strata-fork` gains no tag. After `apply.sh`, the patched tree is committed in the scratch
+only, so `~/strata-fork` gains no tag. A commit id (4 to 40 hex digits) is taken from
+`~/strata-fork` when it has it and fetched otherwise; any other name, such as `main`, is always
+fetched from upstream, so it means upstream's branch and never a local one. A ref git would not
+take as a name (`..`, for one) is refused before any directory is touched. With `--target` and no
+`--tag`, the image is named `strata-cuda:<tag>-kvx-<stage>`, so a build stage never takes the
+runnable image's name. After `apply.sh`, the patched tree is committed in the scratch
 clone with author `kvx` and the release's own commit date, so the same release and the same
 patches always give the same commit id. That id is passed as `STRATA_COMMIT`, which upstream's
 image records (`STRATA_BUILD_COMMIT`) and the dsv41 build stamps into `--version`; the image also
@@ -61,10 +67,16 @@ before, then `kvx/make-patches.sh <new-tag>` and write the new tag into `kvx/BAS
 
 ## On a conflict
 
-`apply.sh` tries each patch as it is first. In a git checkout a patch that does not fit is retried
-with `git apply --3way`, which merges each file against the upstream blob the patch was made from
-(the patches carry full blob ids). It then says one of three things:
+`apply.sh` checks every selected patch before it applies any, so a patch that does not fit leaves
+the tree as it was, the other patch included. It tries each patch as it is first. In a git
+checkout a patch that does not fit is retried with `git apply --3way`, which merges each file
+against the upstream blob the patch was made from (the patches carry full blob ids); that needs
+the files the patch touches to have no uncommitted edits, so `apply.sh` lists any such file and
+stops before changing anything. `--check` runs the same 3-way merge on a copy of the index, so it
+says what the real run will. It then says one of four things:
 
+- **already applied** (or **already in this tree**, when the overlay was merged earlier): nothing
+  to do.
 - **applied cleanly**: nothing to do.
 - **applied with a 3-way merge**, listing the merged files: upstream changed lines near a hook, and
   git merged them. Read the merged hunks (`git diff --cached` in the checkout); `build.sh` carries
@@ -73,7 +85,9 @@ with `git apply --3way`, which merges each file against the upstream blob the pa
   all, e.g. upstream removed or renamed it). Nothing is built.
 
 Outside a git checkout there is no 3-way merge: the patch applies whole or not at all, and the
-files whose hunks do not fit are listed.
+files whose hunks do not fit are listed. An empty `kv-export.patch` is an error, never "nothing to
+do": `make-patches.sh` never writes one (a wrong tag or ref leaves `kvx/patches/` as it was), and
+it pins every diff option itself, so the patches do not depend on anyone's git config.
 
 To resolve one:
 
@@ -199,8 +213,8 @@ need no extra source.
 | upstream ref | kv-export.patch | dsv41-dockerfile.patch | CPU tests after applying |
 |---|---|---|---|
 | v0.2.13.1 (BASE) | clean | clean | 232 + 119 checks, test_kv_export 27 |
-| main at 13eedf55 (2026-11-12, 160 commits past v0.2.13.1) | clean | clean | same |
-| v0.2.12 | clean | clean | same |
+| main at 13eedf55 (2026-11-12, 160 commits past v0.2.13.1) | clean | clean | same (test_kv_export 27) |
+| v0.2.12 | clean | clean | same (test_kv_export 27) |
 
 "Clean" means `git apply` without a 3-way merge. Only the v0.2.13.1 image was built with CUDA
 (`kvx/build.sh v0.2.13.1 --archs "86;89;120" --with-dsv41`); for the other two refs the CUDA compile

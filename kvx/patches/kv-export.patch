@@ -760,10 +760,10 @@ index 0000000000000000000000000000000000000000..6f7b062edca16d65b6c7023573a1a2ae
 +} // namespace strata::program::kv_export
 diff --git a/serve/kv_export.py b/serve/kv_export.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..24b3607aa64b8e73c09bc15dbd98adf8b2c4a10f
+index 0000000000000000000000000000000000000000..69e4fd3b4e0b44a75ae87b103dc5622dca5ad73f
 --- /dev/null
 +++ b/serve/kv_export.py
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,320 @@
 +"""kv-export: a conversation's KV state moved between Strata processes - the Python half.
 +
 +Everything the server adds for kv-export lives here; serve/server.py keeps only the hooks (KV-EXPORT.md has the whole
@@ -776,9 +776,14 @@ index 0000000000000000000000000000000000000000..24b3607aa64b8e73c09bc15dbd98adf8
 +    the endpoints            KvExport: POST /slots/session?action=save|held and POST /slots/0?action=import, mixed
 +                             into server.Service
 +
-+This module imports nothing from serve.server: server.py imports it (and may run as a script, as __main__, where
-+`import serve.server` would load a second copy whose SessionRefused the engine never raises).  server.py hands over
-+the two names the endpoints need with bind(), right before `class Service(kv_export.KvExport)`.
++This module imports nothing from serve.server: server.py imports it.  The two names of server.py the endpoints need,
++SessionRefused and slot_filename_problem, are class attributes of server.Service (kv_refused, kv_filename_problem), not
++globals here: server.py usually runs as __main__ (python -m serve.server), and upstream modules import serve.server
++lazily while serving (serve/replicas.py, serve/split.py), which loads a second copy of server.py.  Each copy's Service
++keeps its own SessionRefused - the one its engine raises - where a global here would hold whichever copy came last.
++
++The session memory's limits, KV_SESSIONS_KEPT and KV_SESSIONS_BYTES, are read here: set them on serve.kv_export (a
++name re-exported by server.py is a copy, and setting it there changes nothing).
 +"""
 +from __future__ import annotations
 +
@@ -789,17 +794,6 @@ index 0000000000000000000000000000000000000000..24b3607aa64b8e73c09bc15dbd98adf8
 +import sys
 +import threading
 +import time
-+
-+# set by bind() (server.py): its SessionRefused and slot_filename_problem
-+SessionRefused = None
-+slot_filename_problem = None
-+
-+
-+def bind(refused_type, filename_problem) -> None:
-+    """server.py's SessionRefused and slot_filename_problem, for the KvExport methods."""
-+    global SessionRefused, slot_filename_problem
-+    SessionRefused, slot_filename_problem = refused_type, filename_problem
-+
 +
 +# kv-export: the client session of the request this thread serves (X-Session-Id / X-Session-Affinity), so the
 +# conversation it ends in can be saved by name afterwards (POST /slots/session?action=save)
@@ -882,10 +876,20 @@ index 0000000000000000000000000000000000000000..24b3607aa64b8e73c09bc15dbd98adf8
 +    return out
 +
 +
++class _NotBound(Exception):
++    """KvExport.kv_refused until the class it is mixed into sets its own: never raised."""
++
++
 +class KvExport:
 +    """kv-export's endpoints, mixed into server.Service (they use its engine, FIFO, status and slot_save_path).
 +    Service.slot_action dispatches to them: /slots/session to session_save (and session_held), action=import on slot
-+    0 to session_import; Service.stream() calls kv_note() with each request's session and prompt."""
++    0 to session_import; Service.stream() calls kv_note() with each request's session and prompt.
++
++    Service sets kv_refused (server.py's SessionRefused, which its engine raises) and kv_filename_problem (its
++    slot_filename_problem, as a staticmethod) - per copy of server.py, see the module docstring."""
++
++    kv_refused: type = _NotBound        # server.Service: SessionRefused
++    kv_filename_problem = None          # server.Service: staticmethod(slot_filename_problem)
 +
 +    def session_save(self, action, filename, session, error, base=None, conv=None) -> tuple[int, dict]:
 +        """kv-export: POST /slots/session?action=save {"session": ID, "filename": NAME} saves the conversation the
@@ -897,7 +901,7 @@ index 0000000000000000000000000000000000000000..24b3607aa64b8e73c09bc15dbd98adf8
 +            return self.session_held(session, error, conv)
 +        if action != "save":
 +            return error(400, "/slots/session supports action=save and action=held")
-+        why = slot_filename_problem(filename)
++        why = self.kv_filename_problem(filename)
 +        if why:
 +            return error(400, f"filename {why}")
 +        with self.status_lock:
@@ -917,7 +921,7 @@ index 0000000000000000000000000000000000000000..24b3607aa64b8e73c09bc15dbd98adf8
 +                conv = (-1, len(ids), name, base_id)
 +                if getattr(eng, "session_save_reclaim", False):
 +                    from serve.session_save_retry import session_file
-+                    return session_file(self, "save", path, SessionRefused, conv=conv)
++                    return session_file(self, "save", path, self.kv_refused, conv=conv)
 +                return eng.session_file("save", path, conv)
 +            with eng.slot_cv:                               # the idle slot holding the longest start with these ids
 +                held = 0
@@ -929,7 +933,7 @@ index 0000000000000000000000000000000000000000..24b3607aa64b8e73c09bc15dbd98adf8
 +            return self.with_control(lambda: eng.session_file("save", path, (found["where"], len(ids), name, base_id)))
 +        try:
 +            r = self.session_op("save", save)
-+        except SessionRefused as e:
++        except self.kv_refused as e:
 +            # the engine refuses a well-formed SAVEC/SAVEX ("invalid") only for the state of that conversation: no
 +            # longer held, decoding, partial, pictures - a conflict with what the engine holds now, not a bad request
 +            body = error(409 if e.kind == "invalid" else e.status, str(e))
@@ -973,7 +977,7 @@ index 0000000000000000000000000000000000000000..24b3607aa64b8e73c09bc15dbd98adf8
 +            return self.with_control(lambda: eng.session_file("held", "", conv))
 +        try:
 +            r = self.session_op("held", held)
-+        except SessionRefused as e:
++        except self.kv_refused as e:
 +            body = error(e.status, str(e))
 +            body[1]["error"]["kind"] = e.kind
 +            return body
@@ -1054,7 +1058,7 @@ index 0000000000000000000000000000000000000000..24b3607aa64b8e73c09bc15dbd98adf8
 +        cache (it never touches the live session or a slot).  With parallel requests it only needs the control lines,
 +        not the FIFO; without, it is a session command under the FIFO like a restore (slot_action's own path for save
 +        and restore: the same checks, the same phase, the same answers - "published" too, as there)."""
-+        why = slot_filename_problem(filename)
++        why = self.kv_filename_problem(filename)
 +        if why:
 +            return error(400, f"filename {why}")
 +        path = os.path.join(self.slot_save_path, filename)
@@ -1068,7 +1072,7 @@ index 0000000000000000000000000000000000000000..24b3607aa64b8e73c09bc15dbd98adf8
 +                r = self.session_op("import", lambda eng: self.with_control(lambda: eng.session_file("import", path)))
 +            else:
 +                r = self.session_op("import", lambda eng: eng.session_file("import", path))
-+        except SessionRefused as e:
++        except self.kv_refused as e:
 +            body = error(e.status, str(e))
 +            body[1]["error"]["kind"] = e.kind
 +            if e.published and not batch:
@@ -1081,7 +1085,7 @@ index 0000000000000000000000000000000000000000..24b3607aa64b8e73c09bc15dbd98adf8
 +        return 200, {"id_slot": 0, "filename": filename, "n_imported": r["tokens"], "n_read": r["bytes"],
 +                     "timings": {"import_ms": r["ms"]}}
 diff --git a/serve/server.py b/serve/server.py
-index 2bffac115f82d5bdb171922b4f6364a810046209..30ad93d5692bc800d79ff62cfb94ff1e36e90240 100644
+index 2bffac115f82d5bdb171922b4f6364a810046209..a04b82f3ba5884fb76b0fecbdd9627fcae5687c3 100644
 --- a/serve/server.py
 +++ b/serve/server.py
 @@ -86,6 +86,9 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
@@ -1089,7 +1093,7 @@ index 2bffac115f82d5bdb171922b4f6364a810046209..30ad93d5692bc800d79ff62cfb94ff1e
  from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
  from serve import images as images_api  # noqa: E402
 +from serve import kv_export  # noqa: E402
-+from serve.kv_export import (KV_SESSION, KV_SESSIONS_KEPT, SESSION_ANSWERS, fnv1a64_ids,  # noqa: E402,F401
++from serve.kv_export import (KV_SESSION, SESSION_ANSWERS, fnv1a64_ids,  # noqa: E402,F401
 +                             kv_session_id, session_answer, session_command)
  
  IM_END = "<|im_end|>"
@@ -1147,10 +1151,10 @@ index 2bffac115f82d5bdb171922b4f6364a810046209..30ad93d5692bc800d79ff62cfb94ff1e
      return path
  
 -class Service:
-+kv_export.bind(SessionRefused, slot_filename_problem)   # kv-export: the Service methods in serve/kv_export.py
-+
-+
 +class Service(kv_export.KvExport):
++    # kv-export: the endpoints in serve/kv_export.py, with this copy's SessionRefused (the one its engine raises)
++    kv_refused, kv_filename_problem = SessionRefused, staticmethod(slot_filename_problem)
++
      def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                   vision: Vision | None = None, sampling_defaults: dict | None = None,
                   fit_max_tokens: bool = True):
@@ -1240,10 +1244,10 @@ index 2e9368add8f1b27a7ed0f54d88d3c0cd720167d7..183da2404ec53d8f38f3a2827c567763
                      raise
 diff --git a/serve/test_kv_export.py b/serve/test_kv_export.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..63737a0088c28ecf0700a38ce0273190e1691e9b
+index 0000000000000000000000000000000000000000..d371f87883fd7f8badfc87678b811e4fd7c46cf9
 --- /dev/null
 +++ b/serve/test_kv_export.py
-@@ -0,0 +1,433 @@
+@@ -0,0 +1,459 @@
 +"""serve/test_kv_export.py - kv-export: POST /slots/session?action=save (SAVEC) and POST /slots/0?action=import (IMPORT),
 +solo and with parallel requests (mock engine: no GPU, no pack).
 +
@@ -1252,6 +1256,7 @@ index 0000000000000000000000000000000000000000..63737a0088c28ecf0700a38ce0273190
 +from __future__ import annotations
 +
 +import collections
++import importlib.util
 +import json
 +import queue
 +import sys
@@ -1265,7 +1270,8 @@ index 0000000000000000000000000000000000000000..63737a0088c28ecf0700a38ce0273190
 +sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 +from serve.frontend import ChatTemplate  # noqa: E402
 +from serve import kv_export, server  # noqa: E402
-+from serve.server import (KV_SESSIONS_KEPT, ByteTokenizer, Service, StrataEngine, fnv1a64_ids,  # noqa: E402
++from serve.kv_export import KV_SESSIONS_KEPT  # noqa: E402
++from serve.server import (ByteTokenizer, Service, StrataEngine, fnv1a64_ids,  # noqa: E402
 +                          kv_session_id, serve)
 +
 +ROOT = Path(__file__).resolve().parents[1]
@@ -1494,6 +1500,30 @@ index 0000000000000000000000000000000000000000..63737a0088c28ecf0700a38ce0273190
 +        code, body = self.save()
 +        self.assertEqual(code, 507)
 +        self.assertEqual(body["error"]["kind"], "storage")
++
++    def test_a_second_copy_of_server_py_keeps_each_ones_refusal(self):
++        # server.py runs as __main__ (python -m serve.server) while upstream modules import serve.server lazily
++        # (serve/replicas.py on every request): a second copy of server.py.  Loading one must not change which
++        # SessionRefused this Service's endpoints catch: a refusal stays 409 / 400 with its "kind"
++        spec = importlib.util.spec_from_file_location("kvx_second_server", ROOT / "serve/server.py")
++        copy = importlib.util.module_from_spec(spec)
++        sys.modules["kvx_second_server"] = copy
++        try:
++            spec.loader.exec_module(copy)
++        finally:
++            del sys.modules["kvx_second_server"]
++        self.assertIsNot(copy.SessionRefused, server.SessionRefused)
++        self.assertIs(copy.Service.kv_refused, copy.SessionRefused)
++        self.assertIs(Service.kv_refused, server.SessionRefused)
++        self.svc.kv_note("s1", [1])
++        Path(self.dir.name, "in.bin").write_bytes(b"f")
++        self.engine.refuse = "that conversation is no longer held there"
++        code, body = self.save()
++        self.assertEqual((code, body["error"].get("kind")), (409, "invalid"), body)
++        code, body = self.post("/slots/0?action=import", {"filename": "in.bin"})
++        self.assertEqual((code, body["error"].get("kind")), (400, "invalid"), body)
++        code, body = self.post("/slots/session?action=held", {"session": "s1"})
++        self.assertEqual((code, body["error"].get("kind")), (400, "invalid"), body)
 +
 +    def test_an_unload_waits_for_a_save_or_an_import(self):
 +        # parallel requests do not hold the FIFO, but unload() takes it: a save or an import must hold it too, or an
