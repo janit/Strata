@@ -12,13 +12,16 @@
 #                           written as its commit id, since a branch moves)
 #   KV-EXPORT.md            a copy of the one the patch carries, for reading the contract without applying it
 #
-# <base> is the upstream commit dev.sh recorded (.git/kvx-base).  The patches are made from commits, never from the
+# <base> is the upstream commit dev.sh recorded (.git/kvx/base).  The patches are made from commits, never from the
 # working tree, so a dev checkout with uncommitted or untracked files is refused: commit first.  --full-index keeps
 # the whole blob ids in the patch, so `git apply --3way` can fall back to a merge on a release whose files moved on.
-# Every option that shapes a diff is pinned here (context, algorithm, prefixes, order, ...), so the patches depend on
-# the commits alone, never on the user's git config.  They are written to a temporary directory and moved into
+# Every option that shapes a diff is pinned here (context, algorithm, prefixes, order, the attributes file that could
+# name a diff driver, GIT_DIFF_OPTS, ...), so the patches depend on the commits alone, never on the user's git config
+# or environment.  .git/info/attributes cannot be switched off from the command line, so a checkout with one is
+# refused.  They are written to a temporary directory and moved into
 # patches/ only when kv-export.patch is not empty.
 set -euo pipefail
+unset GIT_DIFF_OPTS     # it overrides -U3
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 usage() { sed -n '2,/^set /{/^#/p}' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
@@ -35,17 +38,22 @@ done
 [ -n "$dev" ] || { usage >&2; exit 2; }
 [ -d "$dev" ] || { echo "make-patches: no such directory: $dev" >&2; exit 2; }
 dev=$(cd "$dev" && pwd -P)
-gd=$(git -C "$dev" rev-parse --absolute-git-dir 2>/dev/null) && [ -f "$gd/kvx-base" ] && [ -f "$gd/kvx-base-ref" ] ||
-    { echo "make-patches: $dev is not a dev checkout made by ./dev.sh (no .git/kvx-base)" >&2; exit 2; }
+gd=$(git -C "$dev" rev-parse --absolute-git-dir 2>/dev/null) && [ -f "$gd/kvx/base" ] && [ -f "$gd/kvx/base-ref" ] ||
+    { echo "make-patches: $dev is not a dev checkout made by ./dev.sh (no .git/kvx/base)" >&2; exit 2; }
 top=$(git -C "$dev" rev-parse --show-toplevel)
 [ "$(cd "$top" && pwd -P)" = "$dev" ] || { echo "make-patches: $dev is not the top of its checkout ($top is)" >&2; exit 2; }
 
-base=$(tr -d '[:space:]' < "$gd/kvx-base")
-base_ref=$(tr -d '[:space:]' < "$gd/kvx-base-ref")
-dsv41=$(tr -d '[:space:]' 2>/dev/null < "$gd/kvx-dsv41" || echo 1)
+base=$(tr -d '[:space:]' < "$gd/kvx/base")
+base_ref=$(tr -d '[:space:]' < "$gd/kvx/base-ref")
+dsv41=$(tr -d '[:space:]' 2>/dev/null < "$gd/kvx/dsv41" || echo 1)
 git -C "$dev" rev-parse -q --verify "$base^{commit}" >/dev/null || { echo "make-patches: the base $base is not in $dev" >&2; exit 2; }
 git -C "$dev" merge-base --is-ancestor "$base" HEAD ||
     { echo "make-patches: HEAD of $dev does not descend from its base $base_ref ($base)" >&2; exit 2; }
+if [ -s "$gd/info/attributes" ]; then
+    echo "make-patches: $gd/info/attributes exists and can change the patches (a diff driver rewrites hunk headers);" >&2
+    echo "  move it aside while making the patches" >&2
+    exit 2
+fi
 if [ -n "$(git -C "$dev" status --porcelain)" ]; then
     echo "make-patches: $dev has uncommitted or untracked files; the patches are made from HEAD, so commit first:" >&2
     git -C "$dev" status --short | sed 's/^/    /' >&2
@@ -57,7 +65,7 @@ if git -C "$dev" rev-parse -q --verify "refs/tags/$base_ref^{commit}" >/dev/null
    printf '%s' "$base_ref" | grep -qxE '[0-9a-f]{40}'; then new_base=$base_ref; else new_base=$base; fi
 old_base=$(tr -d '[:space:]' < "$here/BASE")
 
-git_opts=(-c core.quotePath=true -c diff.context=3 -c diff.interHunkContext=0 -c diff.algorithm=myers
+git_opts=(-c core.quotePath=true -c core.attributesFile=/dev/null -c diff.context=3 -c diff.interHunkContext=0 -c diff.algorithm=myers
           -c diff.indentHeuristic=true -c diff.suppressBlankEmpty=false -c diff.noprefix=false
           -c diff.mnemonicPrefix=false -c diff.relative=false -c diff.orderFile=/dev/null)
 diff_opts=(--no-color --no-ext-diff --no-textconv --no-renames --full-index --binary --src-prefix=a/ --dst-prefix=b/
@@ -93,6 +101,13 @@ if [ "$check" = 1 ]; then
     exit "$rc"
 fi
 
+# dsv41-dockerfile.patch is kept only while BASE stays: kept across a move, it would still be made against the old
+# release, whose Dockerfile blob a 3-way merge on the new one (fetched with BASE alone) would not have
+if [ "$dsv41" != 1 ] && [ "$new_base" != "$old_base" ]; then
+    echo "make-patches: $dev is on $new_base, BASE is $old_base, and the checkout was made without --with-dsv41, so" >&2
+    echo "  dsv41-dockerfile.patch would stay made against $old_base; make the checkout with --with-dsv41 to move BASE" >&2
+    exit 1
+fi
 # an empty kv-export.patch (nothing committed on the base) never replaces the committed one
 [ -s "$tmp/kv-export.patch" ] || { echo "make-patches: $base_ref..HEAD has no kv-export change; patches/ left as it was" >&2; exit 1; }
 mkdir -p "$here/patches"

@@ -75,13 +75,25 @@ apply_args=("$src")
 "$here/apply.sh" "${apply_args[@]}"
 [ -z "$(git -C "$src" diff --name-only --diff-filter=U)" ] || { echo "build: conflicts left in $src" >&2; exit 1; }
 
-date=$(git -C "$src" log -1 --format=%cI "$commit")
 git -C "$src" add -A
-GIT_AUTHOR_DATE=$date GIT_COMMITTER_DATE=$date \
-    git -C "$src" -c user.name=kvx -c user.email=kvx@localhost -c commit.gpgsign=false \
-    commit -q --no-verify -m "kvx: kv-export on $ref$([ "$dsv41" = 1 ] && echo ' (with strata-dsv41)')" \
-        -m "upstream $commit; patches $(kvx_patch_sums "$dsv41")"
-built=$(git -C "$src" rev-parse HEAD)
+if git -C "$src" diff --cached --quiet "$commit"; then
+    echo "build: the overlay is already in $ref ($commit): applying it changed nothing, so there is no kv-export to" >&2
+    echo "  add; build an upstream ref, not one that carries the overlay" >&2
+    exit 1
+fi
+# The commit is made with commit-tree from fixed inputs alone: commit-tree runs no hooks, the identity and dates come
+# from the environment (which outranks any config), the encoding and signing are pinned, and the message is passed
+# with no trailing whitespace, since commit-tree does no clean-up.  So the same upstream commit and patches give the
+# same id on any machine.
+date=$(git -C "$src" log -1 --format=%cI "$commit")
+tree=$(git -C "$src" write-tree)
+msg1="kvx: kv-export on $ref"
+if [ "$dsv41" = 1 ]; then msg1+=" (with strata-dsv41)"; fi
+msg2=$(printf 'upstream %s; patches %s' "$commit" "$(kvx_patch_sums "$dsv41")" | sed 's/[[:space:]]*$//')
+built=$(GIT_AUTHOR_NAME=kvx GIT_AUTHOR_EMAIL=kvx@localhost GIT_AUTHOR_DATE=$date \
+        GIT_COMMITTER_NAME=kvx GIT_COMMITTER_EMAIL=kvx@localhost GIT_COMMITTER_DATE=$date \
+        git -C "$src" -c i18n.commitEncoding=UTF-8 commit-tree --no-gpg-sign "$tree" -p "$commit" -m "$msg1" -m "$msg2")
+git -C "$src" update-ref --no-deref HEAD "$built"
 echo "kvx: patched tree committed in the scratch checkout as $built"
 
 if [ "$tests" = 1 ]; then

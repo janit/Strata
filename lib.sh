@@ -20,7 +20,7 @@ kvx_safe() {
 # the commit.  A tag is tried first and kept as refs/tags/<ref>; anything else is fetched as it is (FETCH_HEAD).
 kvx_fetch() {
     local src=$1 ref=$2; shift 2
-    if git -C "$src" fetch -q "$@" --no-tags "$kvx_upstream" "refs/tags/$ref:refs/tags/$ref" 2>/dev/null; then
+    if git -C "$src" fetch -q "$@" --no-tags "$kvx_upstream" "+refs/tags/$ref:refs/tags/$ref" 2>/dev/null; then
         git -C "$src" rev-parse "refs/tags/$ref^{commit}"
     elif git -C "$src" fetch -q "$@" --no-tags "$kvx_upstream" "$ref"; then
         git -C "$src" rev-parse "FETCH_HEAD^{commit}"
@@ -34,23 +34,25 @@ kvx_fetch() {
 # kvx_checkout <src> <ref> <shared|own>: a fresh git checkout of upstream <ref> in <src> (removed first), detached at
 # the commit, which is left in $kvx_commit.
 #
-# With $STRATA_REPO (a local Strata clone, optional) the checkout is cloned from it: `shared` borrows its objects
-# (git clone --shared: nothing copied, for a throwaway scratch tree), `own` takes a local copy (hard links where it
-# can) that survives anything done to $STRATA_REPO.  A tag or a commit id it has is used as it is; anything else
-# (main, say) is fetched from upstream, so a branch name always means upstream's branch.  Without $STRATA_REPO the
-# ref is fetched from upstream with --depth 1.  Either way the BASE release is fetched too when it is missing, so
-# `git apply --3way` finds the blobs the patches were made against.
+# A tag or a branch is always resolved by upstream ($kvx_upstream), so it means upstream's tag or branch and nothing
+# else.  $STRATA_REPO (a local Strata clone, optional) only supplies objects: the checkout is cloned from it without
+# its tags or branches, `shared` borrowing its objects (git clone --shared: nothing copied, for a throwaway scratch
+# tree) and `own` taking a local copy (hard links where it can) that survives anything done to $STRATA_REPO, and the
+# ref is then fetched from upstream into it, which downloads only what $STRATA_REPO lacks.  A commit id is a content
+# address rather than a name: one that $STRATA_REPO has (4 to 40 hex digits) is used from it without asking upstream;
+# otherwise it is fetched from upstream and needs all 40 digits.  Without $STRATA_REPO the ref is fetched with
+# --depth 1.  Either way the BASE release is fetched too when it is missing, so `git apply --3way` finds the blobs the
+# patches were made against.
 kvx_checkout() {
     local src=$1 ref=$2 mode=$3 repo=${STRATA_REPO:-} depth=() c=
     rm -rf "$src"
     if [ -n "$repo" ]; then
         git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || { echo "kvx: STRATA_REPO=$repo is not a git repository" >&2; return 2; }
-        if [ "$mode" = shared ]; then git clone -q --shared --no-checkout "$repo" "$src"
-        else git clone -q --no-checkout "$repo" "$src"; fi
-        if c=$(git -C "$src" rev-parse -q --verify "refs/tags/$ref^{commit}"); then
-            echo "kvx: $ref is a tag in $repo"
-        elif printf '%s' "$ref" | grep -qxE '[0-9a-f]{4,40}' && c=$(git -C "$src" rev-parse -q --verify "$ref^{commit}"); then
-            echo "kvx: $ref is a commit in $repo"
+        if [ "$mode" = shared ]; then git clone -q --shared --no-checkout --no-tags "$repo" "$src"
+        else git clone -q --no-checkout --no-tags "$repo" "$src"; fi
+        git -C "$src" remote remove origin     # its branches are not upstream's; only its objects are used
+        if printf '%s' "$ref" | grep -qxE '[0-9a-f]{4,40}' && c=$(git -C "$src" rev-parse -q --verify "$ref^{commit}"); then
+            echo "kvx: $ref is a commit in $repo ($c)"
         else
             c=
         fi
@@ -59,6 +61,11 @@ kvx_checkout() {
         git init -q "$src"
         depth=(--depth 1)
     fi
+    # the files checked out and later committed must not depend on the user's git config: no line-ending conversion,
+    # no attributes file (filters, eol) and, in a scratch tree, no global ignore list keeping a new file out of the commit
+    git -C "$src" config core.autocrlf false
+    git -C "$src" config core.attributesFile /dev/null
+    [ "$mode" = own ] || git -C "$src" config core.excludesFile /dev/null
     if [ -z "$c" ]; then
         echo "kvx: fetching $ref from $kvx_upstream${depth[*]:+ (${depth[*]})}"
         c=$(kvx_fetch "$src" "$ref" "${depth[@]}")

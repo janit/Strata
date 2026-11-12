@@ -11,10 +11,11 @@
 #                    checkout leaves the Dockerfile as upstream has it, and make-patches.sh keeps that patch as it is)
 #
 # The checkout is a git repository on branch kvx-dev: upstream's own commit for <upstream-ref> is the base (tag
-# kvx-base, and recorded in .git/kvx-base, with the ref's name in .git/kvx-base-ref), and on it one commit,
+# kvx-base, and recorded in .git/kvx/base, with the ref's name in .git/kvx/base-ref), and on it one commit,
 # "kv-export overlay", made by ./apply.sh.  Develop there: edit, commit, run `./dev.sh --test <dir>`, then
 # `./make-patches.sh <dir>` writes the commits since the base back into patches/.  A remote `upstream` points at
-# $STRATA_UPSTREAM.  STRATA_REPO, when set, is cloned from instead of downloading what it has (a copy, not shared).
+# $STRATA_UPSTREAM.  STRATA_REPO, when set, is cloned from instead of downloading what it has (a copy, not shared);
+# without it the checkout is shallow (--depth 1): upstream's history is not there for log, blame or a rebase.
 #
 # When the patches do not apply as they are, apply.sh merges them 3-way; on a conflict this stops with the conflict
 # markers in place: resolve them, `git add` the files, `git commit -m "kv-export overlay"`, then test and
@@ -42,9 +43,9 @@ done
 
 if [ "$test" = 1 ]; then
     [ -n "$dir" ] && [ -z "$ref" ] || { echo "usage: ./dev.sh --test <dir>" >&2; exit 2; }
-    gd=$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null) && [ -f "$gd/kvx-base" ] ||
-        { echo "dev: $dir is not a dev checkout made by dev.sh (no .git/kvx-base)" >&2; exit 2; }
-    kvx_tests "$(cd "$dir" && pwd)" "$gd/kvx-bin"
+    gd=$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null) && [ -f "$gd/kvx/base" ] ||
+        { echo "dev: $dir is not a dev checkout made by dev.sh (no .git/kvx/base)" >&2; exit 2; }
+    kvx_tests "$(cd "$dir" && pwd)" "$gd/kvx/bin"
     exit
 fi
 
@@ -65,9 +66,11 @@ git -C "$dir" tag -f kvx-base "$base" >/dev/null
 git -C "$dir" remote remove origin 2>/dev/null || true     # $STRATA_REPO, when cloned from: not a place to push to
 git -C "$dir" remote add upstream "$kvx_upstream"
 gd=$(git -C "$dir" rev-parse --absolute-git-dir)
-printf '%s\n' "$base" > "$gd/kvx-base"
-printf '%s\n' "$ref" > "$gd/kvx-base-ref"
-printf '%s\n' "$dsv41" > "$gd/kvx-dsv41"
+# under .git/kvx/, not .git/kvx-base: a file directly in .git is a ref name to git, and would shadow the tag
+mkdir -p "$gd/kvx"
+printf '%s\n' "$base" > "$gd/kvx/base"
+printf '%s\n' "$ref" > "$gd/kvx/base-ref"
+printf '%s\n' "$dsv41" > "$gd/kvx/dsv41"
 echo "kvx: base $ref = $base (tag kvx-base)"
 
 echo "== kvx: applying the overlay"

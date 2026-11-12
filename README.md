@@ -34,6 +34,9 @@ only thing to maintain is the patch itself.
 
 ## Building
 
+`v0.2.14` in the examples stands for the next upstream release; use a tag upstream has (`v0.2.13.1`,
+say), a branch (`main`) or a commit id.
+
 ```sh
 ./build.sh v0.2.14                                  # strata-cuda:v0.2.14-kvx, archs 86;89;120
 ./build.sh v0.2.14 --with-dsv41 --tag strata-cuda:kvx-0.2.14
@@ -44,22 +47,26 @@ only thing to maintain is the patch itself.
 ./apply.sh ~/some/strata-checkout --check           # report only, change nothing
 ```
 
-A checkout of this branch is all `build.sh` needs. It makes a scratch checkout under
+A checkout of this branch is all `build.sh` needs, wherever it is (`<overlay>` below). It makes a scratch checkout under
 `~/strata-kvx-build/<ref>/src` (`KVX_SCRATCH` overrides the parent). Upstream is
 `https://github.com/Niko1221/Strata.git` (`STRATA_UPSTREAM` overrides it), and the ref is fetched from
 it with `--depth 1`: a tag, a branch (`main` always means upstream's branch) or a commit id with all
 40 digits. When `BASE` is not the ref, `BASE` is fetched too, so a patch that does not apply as it is
 can fall back to a 3-way merge against the blobs it was made from.
 
-`STRATA_REPO`, when set, names a local Strata clone (`~/strata-fork` on the build host, say): the
-scratch checkout is a `git clone --shared` of it, so nothing it already has is downloaded or copied. A
-tag it has, or a commit id it has (4 to 40 hex digits), is used from it; anything else is fetched from
-upstream into the scratch checkout only, so `STRATA_REPO` gains no tag or object. A ref git would not
-take as a name (`..`, for one) is refused before any directory is touched.
+`STRATA_REPO`, when set, names a local Strata clone (`~/strata-fork` on the build host, say), and
+supplies objects only: the scratch checkout is a `git clone --shared --no-tags` of it, so nothing it
+already has is downloaded or copied, but a tag or a branch is still resolved by upstream, so a tag only
+the fork has (`v0.2.13-kvx2`) is refused as it is without `STRATA_REPO`. A commit id is a content
+address rather than a name: one `STRATA_REPO` has (4 to 40 hex digits) is used from it without asking
+upstream. Whatever is fetched goes into the scratch checkout only, so `STRATA_REPO` gains no tag or
+object. A ref git would not take as a name (`..`, for one) is refused before any directory is touched,
+and a ref that already carries the overlay (applying it changes nothing) is refused after `apply.sh`.
 
-After `apply.sh`, the patched tree is committed in the scratch checkout with author `kvx` and the
-upstream commit's own date, so the same upstream commit and the same patches always give the same
-commit id, whether it came from GitHub or from `STRATA_REPO`. That id is passed as `STRATA_COMMIT`,
+After `apply.sh`, the patched tree is committed in the scratch checkout with `git commit-tree`, author
+`kvx` and the upstream commit's own date, and with no hook, signature, encoding or line-ending setting
+of the user's taking part, so the same upstream commit and the same patches always give the same
+commit id, on any machine, whether it came from GitHub or from `STRATA_REPO`. That id is passed as `STRATA_COMMIT`,
 which upstream's image records (`STRATA_BUILD_COMMIT`) and the dsv41 build stamps into `--version`.
 The image carries the labels `kvx.upstream` (the ref), `kvx.upstream-commit`, `kvx.commit` (the
 patched commit), `kvx.dsv41` and `kvx.overlay` (this branch's commit, `dirty` when the overlay
@@ -73,30 +80,42 @@ upstream's pinned commit, as upstream's build always does.
 The patches are never edited by hand. Make a development checkout, work there, and write the patches
 back:
 
+`<overlay>` is wherever this branch is checked out.
+
 ```sh
-./dev.sh v0.2.14 ~/strata-kvx-dev/v0.2.14 --with-dsv41
+<overlay>/dev.sh v0.2.14 ~/strata-kvx-dev/v0.2.14 --with-dsv41
         # upstream v0.2.14 (tag kvx-base), and on it one commit "kv-export overlay" on branch kvx-dev
 cd ~/strata-kvx-dev/v0.2.14
 #   ... on a conflict: resolve, git add, git commit -m "kv-export overlay" (see "On a conflict")
 #   ... edit, commit
-~/strata-kvx-overlay/dev.sh --test ~/strata-kvx-dev/v0.2.14     # CPU tests + serve/test_kv_export.py
-~/strata-kvx-overlay/make-patches.sh ~/strata-kvx-dev/v0.2.14   # patches/, BASE, KV-EXPORT.md
-~/strata-kvx-overlay/build.sh v0.2.14 --target engine-build --build-arg BUILD_VISION=0 --archs 120
-                                                                # the CUDA compile check
+<overlay>/dev.sh --test ~/strata-kvx-dev/v0.2.14     # CPU tests + serve/test_kv_export.py
+<overlay>/make-patches.sh ~/strata-kvx-dev/v0.2.14   # patches/, BASE, KV-EXPORT.md
+<overlay>/build.sh v0.2.14 --target engine-build --build-arg BUILD_VISION=0 --archs 120
+                                                     # the CUDA compile check
 ```
 
-`dev.sh` records the base in the checkout (`.git/kvx-base`, `.git/kvx-base-ref`, `.git/kvx-dsv41`).
+Without `STRATA_REPO` the dev checkout is shallow (`--depth 1`): upstream's history is not in it, so
+`log`, `blame` and a rebase onto a newer release do not work there. Set `STRATA_REPO` to a full clone
+for those. Work in progress is never moved between checkouts by git: write it into `patches/` with
+`make-patches.sh` and commit it on this branch first, then make a new checkout with `dev.sh`.
+
+`dev.sh` records the base in the checkout (`.git/kvx/base`, `.git/kvx/base-ref`, `.git/kvx/dsv41`;
+not directly in `.git`, where a file would shadow the `kvx-base` tag).
 `make-patches.sh` diffs the base against the checkout's `HEAD`: `kv-export.patch` is everything but
 the Dockerfile, `dsv41-dockerfile.patch` the Dockerfile alone. It refuses a checkout with uncommitted
 or untracked files (the patches are made from commits), never writes an empty `kv-export.patch`, and
-pins every diff option itself, so the patches do not depend on anyone's git config. A checkout made
+pins every diff option itself (the attributes file and `GIT_DIFF_OPTS` among them), so the patches
+do not depend on anyone's git config. `.git/info/attributes` cannot be switched off that way, so a
+checkout that has one is refused. A checkout made
 without `--with-dsv41` leaves `dsv41-dockerfile.patch` as it is and must not change the Dockerfile.
 When the checkout's base is another release, `BASE` follows it (a branch is written as its commit id,
-since a branch moves). `make-patches.sh --check <dir>` changes nothing and exits 1 if anything here
+since a branch moves); that needs a checkout made with `--with-dsv41`, so that both patches move to
+the new release together, and one made without it is refused. `make-patches.sh --check <dir>` changes nothing and exits 1 if anything here
 would change.
 
-Moving to a new release is the same flow: `dev.sh <new-tag>` applies the overlay with a 3-way merge
-where it has to, the conflicts (if any) are fixed in that checkout, the tests and the CUDA compile
+Moving to a new release is the same flow, in this order: commit any work in progress on this branch
+(`make-patches.sh` on the old checkout), then `dev.sh <new-tag> <dir> --with-dsv41` applies the
+overlay with a 3-way merge where it has to, the conflicts (if any) are fixed in that checkout, the tests and the CUDA compile
 check pass, and `make-patches.sh` writes patches made against the new release, with `BASE` set to
 it. Commit the result on this branch.
 
