@@ -87,7 +87,7 @@ from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
 from serve import kv_export  # noqa: E402
-from serve.kv_export import (KV_SESSION, KV_SESSIONS_KEPT, SESSION_ANSWERS, fnv1a64_ids,  # noqa: E402,F401
+from serve.kv_export import (KV_SESSION, SESSION_ANSWERS, fnv1a64_ids,  # noqa: E402,F401
                              kv_session_id, session_answer, session_command)
 
 IM_END = "<|im_end|>"
@@ -4727,10 +4727,10 @@ def slot_save_dir(value, base: str | None = None) -> str:
         raise ValueError(f"slot_save_path {path} is not a directory")
     return path
 
-kv_export.bind(SessionRefused, slot_filename_problem)   # kv-export: the Service methods in serve/kv_export.py
-
-
 class Service(kv_export.KvExport):
+    # kv-export: the endpoints in serve/kv_export.py, with this copy's SessionRefused (the one its engine raises)
+    kv_refused, kv_filename_problem = SessionRefused, staticmethod(slot_filename_problem)
+
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = True):

@@ -10,9 +10,14 @@ API and the formats, which are a contract: the engine's lines, the HTTP answers 
     the endpoints            KvExport: POST /slots/session?action=save|held and POST /slots/0?action=import, mixed
                              into server.Service
 
-This module imports nothing from serve.server: server.py imports it (and may run as a script, as __main__, where
-`import serve.server` would load a second copy whose SessionRefused the engine never raises).  server.py hands over
-the two names the endpoints need with bind(), right before `class Service(kv_export.KvExport)`.
+This module imports nothing from serve.server: server.py imports it.  The two names of server.py the endpoints need,
+SessionRefused and slot_filename_problem, are class attributes of server.Service (kv_refused, kv_filename_problem), not
+globals here: server.py usually runs as __main__ (python -m serve.server), and upstream modules import serve.server
+lazily while serving (serve/replicas.py, serve/split.py), which loads a second copy of server.py.  Each copy's Service
+keeps its own SessionRefused - the one its engine raises - where a global here would hold whichever copy came last.
+
+The session memory's limits, KV_SESSIONS_KEPT and KV_SESSIONS_BYTES, are read here: set them on serve.kv_export (a
+name re-exported by server.py is a copy, and setting it there changes nothing).
 """
 from __future__ import annotations
 
@@ -23,17 +28,6 @@ import os
 import sys
 import threading
 import time
-
-# set by bind() (server.py): its SessionRefused and slot_filename_problem
-SessionRefused = None
-slot_filename_problem = None
-
-
-def bind(refused_type, filename_problem) -> None:
-    """server.py's SessionRefused and slot_filename_problem, for the KvExport methods."""
-    global SessionRefused, slot_filename_problem
-    SessionRefused, slot_filename_problem = refused_type, filename_problem
-
 
 # kv-export: the client session of the request this thread serves (X-Session-Id / X-Session-Affinity), so the
 # conversation it ends in can be saved by name afterwards (POST /slots/session?action=save)
@@ -116,10 +110,20 @@ def session_answer(want: str, f: list, count) -> dict:
     return out
 
 
+class _NotBound(Exception):
+    """KvExport.kv_refused until the class it is mixed into sets its own: never raised."""
+
+
 class KvExport:
     """kv-export's endpoints, mixed into server.Service (they use its engine, FIFO, status and slot_save_path).
     Service.slot_action dispatches to them: /slots/session to session_save (and session_held), action=import on slot
-    0 to session_import; Service.stream() calls kv_note() with each request's session and prompt."""
+    0 to session_import; Service.stream() calls kv_note() with each request's session and prompt.
+
+    Service sets kv_refused (server.py's SessionRefused, which its engine raises) and kv_filename_problem (its
+    slot_filename_problem, as a staticmethod) - per copy of server.py, see the module docstring."""
+
+    kv_refused: type = _NotBound        # server.Service: SessionRefused
+    kv_filename_problem = None          # server.Service: staticmethod(slot_filename_problem)
 
     def session_save(self, action, filename, session, error, base=None, conv=None) -> tuple[int, dict]:
         """kv-export: POST /slots/session?action=save {"session": ID, "filename": NAME} saves the conversation the
@@ -131,7 +135,7 @@ class KvExport:
             return self.session_held(session, error, conv)
         if action != "save":
             return error(400, "/slots/session supports action=save and action=held")
-        why = slot_filename_problem(filename)
+        why = self.kv_filename_problem(filename)
         if why:
             return error(400, f"filename {why}")
         with self.status_lock:
@@ -151,7 +155,7 @@ class KvExport:
                 conv = (-1, len(ids), name, base_id)
                 if getattr(eng, "session_save_reclaim", False):
                     from serve.session_save_retry import session_file
-                    return session_file(self, "save", path, SessionRefused, conv=conv)
+                    return session_file(self, "save", path, self.kv_refused, conv=conv)
                 return eng.session_file("save", path, conv)
             with eng.slot_cv:                               # the idle slot holding the longest start with these ids
                 held = 0
@@ -163,7 +167,7 @@ class KvExport:
             return self.with_control(lambda: eng.session_file("save", path, (found["where"], len(ids), name, base_id)))
         try:
             r = self.session_op("save", save)
-        except SessionRefused as e:
+        except self.kv_refused as e:
             # the engine refuses a well-formed SAVEC/SAVEX ("invalid") only for the state of that conversation: no
             # longer held, decoding, partial, pictures - a conflict with what the engine holds now, not a bad request
             body = error(409 if e.kind == "invalid" else e.status, str(e))
@@ -207,7 +211,7 @@ class KvExport:
             return self.with_control(lambda: eng.session_file("held", "", conv))
         try:
             r = self.session_op("held", held)
-        except SessionRefused as e:
+        except self.kv_refused as e:
             body = error(e.status, str(e))
             body[1]["error"]["kind"] = e.kind
             return body
@@ -288,7 +292,7 @@ class KvExport:
         cache (it never touches the live session or a slot).  With parallel requests it only needs the control lines,
         not the FIFO; without, it is a session command under the FIFO like a restore (slot_action's own path for save
         and restore: the same checks, the same phase, the same answers - "published" too, as there)."""
-        why = slot_filename_problem(filename)
+        why = self.kv_filename_problem(filename)
         if why:
             return error(400, f"filename {why}")
         path = os.path.join(self.slot_save_path, filename)
@@ -302,7 +306,7 @@ class KvExport:
                 r = self.session_op("import", lambda eng: self.with_control(lambda: eng.session_file("import", path)))
             else:
                 r = self.session_op("import", lambda eng: eng.session_file("import", path))
-        except SessionRefused as e:
+        except self.kv_refused as e:
             body = error(e.status, str(e))
             body[1]["error"]["kind"] = e.kind
             if e.published and not batch:

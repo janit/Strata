@@ -6,6 +6,7 @@ solo and with parallel requests (mock engine: no GPU, no pack).
 from __future__ import annotations
 
 import collections
+import importlib.util
 import json
 import queue
 import sys
@@ -19,7 +20,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve import kv_export, server  # noqa: E402
-from serve.server import (KV_SESSIONS_KEPT, ByteTokenizer, Service, StrataEngine, fnv1a64_ids,  # noqa: E402
+from serve.kv_export import KV_SESSIONS_KEPT  # noqa: E402
+from serve.server import (ByteTokenizer, Service, StrataEngine, fnv1a64_ids,  # noqa: E402
                           kv_session_id, serve)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -248,6 +250,30 @@ class KvExport(unittest.TestCase):
         code, body = self.save()
         self.assertEqual(code, 507)
         self.assertEqual(body["error"]["kind"], "storage")
+
+    def test_a_second_copy_of_server_py_keeps_each_ones_refusal(self):
+        # server.py runs as __main__ (python -m serve.server) while upstream modules import serve.server lazily
+        # (serve/replicas.py on every request): a second copy of server.py.  Loading one must not change which
+        # SessionRefused this Service's endpoints catch: a refusal stays 409 / 400 with its "kind"
+        spec = importlib.util.spec_from_file_location("kvx_second_server", ROOT / "serve/server.py")
+        copy = importlib.util.module_from_spec(spec)
+        sys.modules["kvx_second_server"] = copy
+        try:
+            spec.loader.exec_module(copy)
+        finally:
+            del sys.modules["kvx_second_server"]
+        self.assertIsNot(copy.SessionRefused, server.SessionRefused)
+        self.assertIs(copy.Service.kv_refused, copy.SessionRefused)
+        self.assertIs(Service.kv_refused, server.SessionRefused)
+        self.svc.kv_note("s1", [1])
+        Path(self.dir.name, "in.bin").write_bytes(b"f")
+        self.engine.refuse = "that conversation is no longer held there"
+        code, body = self.save()
+        self.assertEqual((code, body["error"].get("kind")), (409, "invalid"), body)
+        code, body = self.post("/slots/0?action=import", {"filename": "in.bin"})
+        self.assertEqual((code, body["error"].get("kind")), (400, "invalid"), body)
+        code, body = self.post("/slots/session?action=held", {"session": "s1"})
+        self.assertEqual((code, body["error"].get("kind")), (400, "invalid"), body)
 
     def test_an_unload_waits_for_a_save_or_an_import(self):
         # parallel requests do not hold the FIFO, but unload() takes it: a save or an import must hold it too, or an

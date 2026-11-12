@@ -28,7 +28,7 @@ field from one release to the next:
 - On-disk formats: session files (`STRSESS`) and delta files (`STRSDLT` v1), and the ids hash
   (FNV-1a 64 over little-endian int32, `session_ids_fnv1a64` / `fnv1a64_ids`).
 
-The tests that pin it travel inside the patch: `serve/test_kv_export.py` (26 tests) and the
+The tests that pin it travel inside the patch: `serve/test_kv_export.py` (27 tests) and the
 kv-export checks in `src/core/conversation_file_test.cpp` (232 checks in all, with upstream's own),
 plus upstream's `src/core/session_save_reclaim_test.cpp` (119), which the save path also touches.
 `build.sh` runs all three before it builds.
@@ -99,7 +99,7 @@ What the patch changes in upstream's own files. Everything else in the patch is 
 ### `serve/server.py` (+29 / -12)
 
 - Imports, after `from serve import images as images_api`: `from serve import kv_export` and the
-  re-exported names (`KV_SESSION`, `KV_SESSIONS_KEPT`, `SESSION_ANSWERS`, `fnv1a64_ids`,
+  re-exported names (`KV_SESSION`, `SESSION_ANSWERS`, `fnv1a64_ids`,
   `kv_session_id`, `session_answer`, `session_command`).
 - `StrataEngine.session_file` / `_session_file`: a third argument, `conv`, passed through.
 - `_session_file`: the command line and the awaited answer come from
@@ -107,8 +107,13 @@ What the patch changes in upstream's own files. Everything else in the patch is 
   `want = ...`, and the stdin write is under `with getattr(self, "wlock", None) or contextlib.nullcontext():`.
 - `_session_file`'s answer loop: `if head == want and want in SESSION_ANSWERS:` returns
   `session_answer(...)` (HELD, SAVEDX); a malformed answer is `out_of_step(line)`.
-- Before `class Service`: `kv_export.bind(SessionRefused, slot_filename_problem)`, and
-  `class Service(kv_export.KvExport)`.
+- `class Service(kv_export.KvExport)`, and as its first statement the class attributes
+  `kv_refused, kv_filename_problem = SessionRefused, staticmethod(slot_filename_problem)`: class
+  attributes rather than globals of `serve/kv_export.py`, because server.py usually runs as
+  `__main__` and upstream modules (`serve/replicas.py`, `serve/split.py`) import `serve.server`
+  while serving, which loads a second copy whose `SessionRefused` the running engine never raises.
+  The session memory's limits (`KV_SESSIONS_KEPT`, `KV_SESSIONS_BYTES`) are set on
+  `serve.kv_export`, not on `serve.server`.
 - `Service.slot_action`: the arguments `session=None, base=None, conv=None`; `slot == "session"`
   goes to `self.session_save(...)`, `action == "import" and slot == "0"` to `self.session_import(...)`;
   the error text `"action must be save, restore or import"`.
@@ -193,7 +198,7 @@ need no extra source.
 
 | upstream ref | kv-export.patch | dsv41-dockerfile.patch | CPU tests after applying |
 |---|---|---|---|
-| v0.2.13.1 (BASE) | clean | clean | 232 + 119 checks, test_kv_export 26 |
+| v0.2.13.1 (BASE) | clean | clean | 232 + 119 checks, test_kv_export 27 |
 | main at 13eedf55 (2026-11-12, 160 commits past v0.2.13.1) | clean | clean | same |
 | v0.2.12 | clean | clean | same |
 
