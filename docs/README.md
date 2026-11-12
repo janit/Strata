@@ -1,6 +1,6 @@
 # Strata guides
 
-**New here? Start with [Install Strata](INSTALL.md).** Download the one installer for your system (Windows, Linux or Mac), or install the Terminal with one line. Both use released engine packages. This documentation is for version 0.2.5.
+**New here? Start with [Install Strata](INSTALL.md).** Download the one installer for your system (Windows, Linux or Mac), or install the Terminal with one line. Both use released engine packages. This documentation is for version 0.2.13.
 
 ## Use Strata
 
@@ -9,6 +9,7 @@
 | Install or update | [Desktop app and Terminal](INSTALL.md) |
 | Choose a model and check memory | [Models and quantizations](MODELS.md) |
 | Run DeepSeek V4.1-Flash (app and Terminal) | [DeepSeek V4.1-Flash](MODELS.md#deepseek-v41-flash) |
+| See which model runs on which hardware | [Model and hardware table](CAPABILITIES.md) |
 | Start from the command line | [Terminal launch](TERMINAL_LAUNCH.md) |
 | Connect a coding tool | [Tool connections](TERMINAL_LAUNCH.md#connect-your-apps-strata-connect) |
 | Fix an install or startup problem | [Troubleshooting](TROUBLESHOOTING.md) |
@@ -22,10 +23,11 @@ Use the guide for your GPU and operating system. Model and feature support can d
 | --- | --- |
 | NVIDIA RTX 20 / 30 / 40 / 50 | [Install](INSTALL.md#what-you-need) |
 | AMD Radeon (RX and AI PRO R9700) | [AMD / HIP](AMD_HIP.md) |
-| AMD Ryzen AI Max / Strix Halo | [Strix Halo](STRIX_HALO.md) |
+| AMD Ryzen AI Max / Strix Halo | [Strix Halo](STRIX_HALO.md), [on Windows](STRIX_HALO_WINDOWS.md) |
 | Intel Arc on Linux | [Intel Arc](INTEL_ARC.md) |
 | Apple Silicon | [Mac / Metal](MAC.md) |
 | More than one GPU | [Multiple GPUs](MULTI_GPU.md) |
+| Two cards: one reads the prompt, one makes the answer (opt-in) | [Split serving](SPLIT_SERVE.md) |
 | Older GPUs | [Experimental hardware](OLDER_GPUS.md) |
 
 ## Developers and contributors
@@ -35,6 +37,7 @@ Use the guide for your GPU and operating system. Model and feature support can d
 - [Contribution rules](../CONTRIBUTING.md)
 - [Community benchmarks](COMMUNITY_BENCHMARKS.md) and the [standard benchmark protocol](BENCHMARK_PROTOCOL.md)
 - [How the engine works](HOW_IT_WORKS.md), [technical reference](DETAILS.md) and [Terminal reference](TERMINAL.md)
+- [KVA: approximate prompt processing for the late layers (experimental, opt-in)](KVA.md)
 - [App development](../apps/host/README.md) and [packaging](../packaging/README.md)
 
 ## AI tools and media
