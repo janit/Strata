@@ -8,6 +8,7 @@
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
+#include "strata/core/session_delta.hpp"   // kv-export: kSessionChunk, SessionKvChunks, SessionDelta, session_ids_fnv1a64
 
 #include <array>
 #include <cstddef>
@@ -41,9 +42,6 @@ private:
     uint64_t total_ = 0;
 };
 uint64_t session_hash64(const void* data, size_t n, uint64_t seed);
-// kv-export: FNV-1a 64 over token ids as little-endian int32 - how SAVEC and the server (serve/server.py
-// fnv1a64_ids) name a conversation by its prompt.  {0, 1, -1, 151643} -> 0x2401b33d3e943579.
-uint64_t session_ids_fnv1a64(const int32_t* ids, size_t n);
 
 // Typed, length-delimited fields for an identity hash: each field is (tag, type, length, bytes), so two different
 // field lists never give the same byte stream, and a double is hashed by its exact bits (no decimal rounding).
@@ -146,20 +144,6 @@ using SessionPhase = std::function<void(const char* phase, uint64_t bytes)>;
 int64_t session_phase_limit_s(uint64_t bytes);
 
 // Optional knobs of a write.
-// kv-export: incremental saves.  Every K/V part (k, v, k_scale, v_scale, pooled of each layer) is also described by
-// the session_hash64 (seed 0) of each kSessionChunk bytes of it (the last chunk may be shorter): a save can return
-// them, and a delta save against a base reuses the base's for the bytes it keeps.
-constexpr uint64_t kSessionChunk = 256u << 10;
-using SessionKvChunks = std::vector<std::array<std::vector<uint64_t>, 5>>;   // per K/V layer, per part
-// A delta file (STRSDLT v1) instead of a session file: each K/V part is written as (size, keep, the bytes from keep
-// on, the chunk hashes of the whole new part).  keep[layer][part] is a multiple of kSessionChunk (or 0) and at most the
-// part's size and the base's: the receiver rebuilds the session file from the base save it holds.
-struct SessionDelta {
-    uint64_t base = 0, id = 0;                    // the base save's id and this save's
-    std::vector<std::array<uint64_t, 5>> keep;   // per K/V layer
-    const SessionKvChunks* base_chunks = nullptr; // the base's chunk hashes: the first keep / kSessionChunk are reused
-};
-
 struct SessionWriteOptions {
     // the free-space PREFLIGHT: refused when the disk has less than the new file plus this many bytes free before the
     // write starts.  Not a reservation: other writers can take the space afterwards.
