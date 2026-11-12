@@ -1,0 +1,2672 @@
+diff --git a/KV-EXPORT.md b/KV-EXPORT.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..e2505f5364b0bbc9b601a19f8d7bcbdcd9e34a84
+--- /dev/null
++++ b/KV-EXPORT.md
+@@ -0,0 +1,258 @@
++# kv-export (fork of Strata)
++
++Branch `kv-export-0.2.13` of github.com/janit/Strata, based on Strata v0.2.13.1 (tag `v0.2.13-kvx1`; branches
++`kv-export-0.2.6`, `kv-export-0.2` and `kv-export` are the same work on v0.2.6, v0.2.3.1 and v0.1.45). It adds what a
++serving fleet needs to move a conversation between Strata processes on different hosts. Everything
++else behaves exactly as upstream does.
++
++The additions live in files of their own (`include/strata/program/kv_export.hpp`,
++`include/strata/core/session_delta.hpp`, `src/core/session_delta_file.hpp`, `serve/kv_export.py`);
++upstream's files carry only thin hooks marked `kv-export`. Branch `kv-export-hooks` also ships them
++as a patch overlay in `kvx/` (not part of the patch itself): `kvx/build.sh <upstream-tag>` applies
++`kvx/patches/kv-export.patch` to a checkout of any upstream release, runs the tests and builds the
++image. `kvx/README.md` lists every hook site and says what to do when a release conflicts.
++
++A session that spills from its host to another one normally pays a cold prefill there (41 s for 50k
++tokens on one RTX A4000). With these additions, the host that served the turn saves the
++conversation by its client session id. A replica on another host is parked there and continues
++warm when the session arrives (about 1 s).
++
++## Additions
++
++### Saving a conversation by client session: `POST /slots/session?action=save`
++
++```
++POST /slots/session?action=save
++{"session": "<X-Session-Affinity, else X-Session-Id, of the session's requests>", "filename": "<name>"}
++-> 200 {"id_slot", "session", "filename", "n_saved", "n_written", "timings": {"save_ms"}}
++   404  no request of that session on this server (the last 1024 sessions are remembered)
++   409  that conversation is no longer held (another request took its slot)
++```
++
++- The server remembers the prompt ids of each session's last request. The session is the first
++  non-empty header of `X-Session-Affinity` and `X-Session-Id`, taken as it is (the order viiwork
++  routes by), printable ASCII only, at most 256 bytes.
++- With parallel requests it saves from the idle batch slot that holds the longest conversation
++  starting with those ids, else from the live session. When the live session has moved on
++  (another session's request took it and parked this conversation), the engine saves the longest
++  parked conversation that starts with them, straight from RAM. That file is the one a save of it
++  as the live session would write (`session_file_write_parked`: only the deepest checkpoint). It takes the control lines like an
++  admission, so slots that are already decoding carry on.
++- The engine command is `SAVEC <slot|-1> <n> <hash> <path>`. The engine refuses unless its
++  conversation's first `n` ids hash (FNV-1a 64 over little-endian int32,
++  `session_ids_fnv1a64`) to `hash`, so a slot that changed hands is never saved under the wrong
++  name. It also refuses a slot that is decoding, partial, tainted or has pictures.
++- A batch slot's draft K/V is its own with `--batch-mtp`. Otherwise it is the solo drafter's,
++  which only proposes drafts: the verifier decides, so the output is the same.
++
++### Importing into the parking cache: `POST /slots/0?action=import`
++
++```
++POST /slots/0?action=import {"filename": "<name>"}
++-> 200 {"id_slot": 0, "filename", "n_imported", "n_read", "timings": {"import_ms"}}
++```
++
++- The file is read and validated like a restore (`IMPORT <path>`), then parked in the
++  conversation cache. The live session and the batch slots are untouched, and a later request
++  whose prompt matches resumes from it, as it would from any parked conversation.
++- Needs `--conversation-cache-mib` > 0. It works beside `--batch` (parallel requests), where it
++  takes the control lines like an admission.
++
++### Asking whether a conversation is still held: `POST /slots/session?action=held`
++
++```
++POST /slots/session?action=held {"session": "<X-Session-Id>"}
++POST /slots/session?action=held {"session": "<X-Session-Id>", "n": <tokens>, "hash": "<16 hex>"}
++-> 200 {"session", "n_held"}
++```
++
++- With `n` and `hash` (FNV-1a 64 over the first `n` token ids as little-endian int32, as SAVEC
++  names a conversation) the engine is asked for that conversation, not the session's: a node
++  sends its replica's own ids. Without them the server uses the session's last prompt here,
++  which after a compaction on another host is a different branch, so a node could be told
++  "held" for a conversation the next turn cannot use.
++
++- `n_held` is the length of the longest conversation the engine still holds that starts with
++  the session's last prompt on this server: the live session, a batch slot or a parked
++  conversation (`HELD <n> <hash>`, named as SAVEC names one). It is 0 when there is none, and
++  when this server never saw the session.
++- Read only: nothing is saved, moved or touched, and the server is not marked busy. With
++  `--batch` it takes the control lines between two admissions, like a save.
++- Why: the conversation cache evicts oldest first and does not say which conversation it
++  evicted. A node that imported a replica earlier asks before the next turn, and imports again
++  when the engine no longer holds the conversation (viiwork, janit/viiwork#1).
++
++`slot_save_path` (or `--slot-save-path`) names the folder for both, as for upstream's
++save/restore. Upstream's `/slots/0?action=save|restore` still refuse parallel requests.
++
++## Measurements (one RTX A4000 per process, IQ3_XXS, 64k context)
++
++| 50k-token conversation | |
++|---|---|
++| session file | 1.0 GB (about 20 KiB per token) |
++| save | 0.56 s, blocking every slot of the engine (ext4; tmpfs is slower). It was 0.80 s before the two changes below |
++| save, split | live state off the device 80–90 ms; K/V off the device 65–120 ms; payload hash 170 ms; disk the rest |
++| import | 0.64 s (about 1.1 s for the first imports into a process, which allocate fresh RAM); the reader reads the next block on a thread while it parses the current one |
++| next turn after import | 0.8–2.0 s, against 41 s cold; output identical to the original host |
++
++Consecutive turns' files differ in 240 MB of 1.0 GB. The K/V is byte-identical up to the reuse
++point; the running state (118 MB fp32) is rewritten twice, in the live copy and in the deepest
++checkpoint. The checkpoint matters: a client that re-renders the last reply resumes from it.
++
++## A shorter save
++
++Two changes, both in the session writer and both producing the same bytes (pinned by tests):
++
++- **The deepest checkpoint by reference** (`SessionWriteOptions::checkpoints`). A save copied it
++  (118 MB) twice before writing it. The engine now checks it as the view did, as a prefix of the
++  live tokens and pictures with one carve's state.
++- **Write-behind** (`SessionWriteOptions::write_behind`, on by default). Each full 16 MiB block
++  goes to a writer thread while the next one is filled, so the disk overlaps the K/V reads and the
++  hashing.
++
++A live save and a save of the same conversation after it was parked go through different code. In
++one process they wrote byte-identical files, which is the correctness check that does not depend on
++the engine being deterministic. It is not: two fresh processes given the same prompt write
++different files (one token more, K/V that differs from about cell 49,152). Compare continuations
++across processes by their answers, not their bytes.
++
++On teddy (a 97% full NVMe, 1.2–1.3 GB/s direct writes) a save is now disk-bound: hashing on the
++writer thread instead was no faster, and on a faster disk it would be slower. Writing fewer bytes is the incremental save below.
++
++## Incremental saves
++
++```
++POST /slots/session?action=save {"session", "filename", "base": "<save_id of an earlier save>"}   (base optional)
++-> 200 {..., "save_id": "<16 hex>", "base": "<16 hex>" | null, "delta": true | false}
++```
++
++Every save by session has a `save_id` (engine command `SAVEX`, answer `SAVEDX`). Given the id
++of an earlier save of the same conversation that the engine still remembers (its last 64 saves,
++per process), it writes a **delta file** instead of a session file. A delta keeps the bytes of the
++cells before the first token that differs from the base's tokens: whole pages, whole indexer rows,
++the draft one cell less, rounded down to whole 256 KiB chunks. A kept cell always holds the key and
++value of the same token at the same position as in the new state, so a delta never carries a cell
++of another token. A conversation with pictures, a different control vector or another
++K/V layout saves in full. `"delta": false` means a full session file (no base, an unknown base, or
++nothing to keep).
++
++**STRSDLT v1** (little-endian):
++
++- **Header, 80 bytes:** `STRSDLT\x01`, u32 version 1, u32 header size 80, u64 model fingerprint,
++  u64 config fingerprint, u64 payload length (the bytes between header and trailer), u64 base
++  save_id, u64 new save_id, u64 size of the session file it rebuilds, u64 reserved 0, u64
++  `session_hash64(first 72 bytes, 0)`.
++- **Payload:** the STRSESS payload in order. Each K/V buffer's u64 size is followed by u64 keep (a
++  multiple of 262144), then the bytes from keep on, then u64 n = ceil(size / 262144) and n chunk
++  hashes. Chunk hash i is `session_hash64` (seed 0) of bytes [i*262144, min(size, (i+1)*262144))
++  of the whole new part.
++- **Trailer:** u64 `session_hash64(payload, 0)`, then `STRSDEND`.
++
++Rebuild: the session file's header for the new payload length, the payload with each K/V buffer as
++u64 size, the base part's first keep bytes and the delta's tail, then the trailer (the payload's
++`session_hash64` and `STRSEND\x01`). Check every chunk hash against the rebuilt part.
++`rebuild()` in `src/core/conversation_file_test.cpp` is the reference.
++
++What the chunk hashes protect is the receiver's copy (damage at rest, a wrong apply). Kept chunks
++carry the base's hashes, so they cannot catch a keep that went past a real change: that is the
++engine's rule above.
++
++**Byte for byte, or the same tokens.** The rule is by tokens, not bytes. When the engine reused every
++cell of the base since that save (the usual case: each turn appends to the conversation), base +
++delta rebuilds the engine's own full save of the same state byte for byte. When the conversation
++diverged inside the base (an edited or regenerated message), the engine resumes from its deepest
++checkpoint before the divergence and reads the cells after it again. Their bytes then differ
++slightly (float noise from another prefill chunk), and the delta keeps the base's copies of those
++cells up to the divergence. They hold the same tokens, so this is the same kind of difference as
++between two processes, never a stale cell. Tracking every point the engine read again since a base
++would make this exact too; it was not worth the complexity.
++
++Checked on real saves in one process (Strata v0.2.3.1, RTX A4000, 50k tokens). Each test compared
++base + delta with the device's own full save of the same state:
++
++| KV format | appended turn | diverged turn (another question after the same document) |
++|---|---|---|
++| int8 | identical (live, batch and parked paths) | cells 49,152-49,663 differ, all before the first differing token (50,003) |
++| q4_0 | identical | identical |
++| k8v4 | identical (batch path) | cells 49,152-49,663 differ, all before 50,003 |
++| fp16 | identical (parked path) | cells 49,152-49,919 differ, all before 50,003 |
++
++The delta is about 240 MB in every format, mostly the running state, which is rewritten whole. The
++full file is 0.69 GB (q4_0), 0.86 GB (k8v4), 1.0 GB (int8) or 1.65 GB (fp16). Every answer was correct.
++
++| 50k-token turn, RTX A4000 | full save | delta |
++|---|---|---|
++| live session | 1.0 GB, 0.71 s | 244 MB, 0.30 s |
++| batch backend (parallel 2) | 1.0 GB, 0.63 s | 244 MB, 0.26 s |
++| parked conversation | 1.0 GB, 0.64 s | 244 MB, 0.19 s |
++
++## Where the files go
++
++Session and delta files are a cache: a lost file costs one cold prefill (about 40 s at 50k tokens on
++an RTX A4000), never a wrong answer. Durability does not matter; write endurance and write speed
++do. A serving host writes a delta of about 240 MB every turn of a long session, and the host that
++keeps the replica writes as much again. A full save on teddy is bound by its disk (1.2 GB/s), and
++every slot of the engine waits while it runs.
++
++Put `slot_save_path` (and viiwork's `kv_share.dir`) on their own drive, not the system disk.
++Prefer Intel Optane, rated for 30–100 drive writes a day. Use the same mount path on every host
++of a group. About 1 GB per 50k-token conversation, so even a 280 GB drive holds a few hundred.
++tmpfs measured slower than ext4 with O_DIRECT (1.12 vs 0.68 s for a full save).
++
++## Server memory
++
++The server remembers the prompt of each session's last request so that it can find the
++conversation again. It keeps the last 1024 sessions, packed as int32 (4 bytes a token), with at
++most 64 MiB in total; the oldest go first. It hashes a prompt before taking the control lines (36
++ms per 50k tokens), not while holding them.
++
++## On v0.2.13.1
++
++Merged from v0.2.6-kvx2. Upstream's #4451 made `vram()` and `session_file()` take a `--batch`
++engine's control lines themselves, the same fix this fork had made for its own save, held and import
++calls (`with_control`). `session_file()` now does that through upstream's `_exclusive_control()`, and
++`with_control` marks the lines held (`_ctl_held`, as upstream's `Service.vram` does) so the call
++inside does not wait for lines its own thread holds. No change to the commands, the file formats or
++the HTTP API.
++
++Checked on forge-white (RTX 5090, IQ3_XXS, parallel 4, int8 KV): a 31k-token conversation saved by
++session (709 MB in 0.66 s), a delta after one more turn (246 MB in 0.27 s, against that base), then
++the engine restarted, the full file imported (0.66 s), and the next turn went on in 0.40 s with
++30,946 of 30,986 tokens cached against 9.4 s cold. The serve suite (1,524 tests), the kv-export
++tests and the CPU session-file tests (351 checks) pass. After a restart a held query **by session**
++answers 0 even for an imported conversation (the new server has no prompt remembered for that
++session); a caller asks by `{n, hash}`, as viiwork does.
++
++## On v0.2.3.1
++
++Merged from v0.1.45 with no change to the additions: upstream did not touch the session-file or
++conversation-cache code, and the session commands keep v0.1.45's answers (`SERR`, `SESSION`,
++`SWAIT`). Checked again on teddy with this branch's image: base + delta rebuilt the full save byte
++for byte on the live, batch and parked paths (244 MB deltas in 0.19–0.26 s, full saves 0.56–0.70
++s), and a 50k-token conversation saved on one process, imported into another (1.2 s), went on
++there in 1.9 s with 50,029 tokens cached.
++
++Two upstream changes matter to a caller:
++
++- The conversation cache is on by default (sized from the free RAM), so IMPORT no longer needs an
++  explicit `--conversation-cache-mib`; `0` still turns it off.
++- The image layout is new: the server runs from `/opt/strata/terminal` with its own Python
++  (`/opt/strata/terminal/python/bin/python3 -m serve.server`), and the engine is
++  `/opt/strata/components/engine/<version>/strata`, whose folder must be in the config's
++  `lib_dirs` (it carries libcudart). The root `Dockerfile` needs
++  `--build-arg STRATA_COMMIT=$(git rev-parse HEAD)` (fixed here; upstream's fails without it).
++
++## Tests
++
++- `serve/test_kv_export.py`: session header, ids hash vector, the session memory, save solo and
++  in parallel (which slot is chosen, 404, 409, the control lines given back), import solo and in
++  parallel.
++- `src/core/conversation_file_test.cpp`: `session_ids_fnv1a64` against the same vector; a parked
++  image's file equals the file of the image holding only its deepest checkpoint; write-behind and
++  in-place writes are byte-identical; checkpoints by reference equal checkpoints copied into the
++  image; delta saves (base + delta rebuild the full file byte for byte, also for a parked image;
++  a damaged base or delta is caught; a keep that is not whole chunks of the part and the base is
++  refused). It also runs under ThreadSanitizer, except the address-space limit test, which
++  ThreadSanitizer cannot run.
++- `serve/test_kv_export.py` also covers the base field: a delta answer, an unknown base, malformed
++  ids, and an answer out of step, which ends the engine.
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index 78ff9f189240434f38c74a836a3db49b3f609380..2235cd47463294451e021f94336f05c3d8b2cdec 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -364,6 +364,8 @@ public:
+             if (serials_[i] == serial) return i;
+         return SIZE_MAX;
+     }
++    // kv-export: the parked entries in order (oldest first), for a lookup by something other than a prompt
++    const SavedConversation& at(size_t index) const { return entries_.at(index); }
+     const SavedConversation* find(uint64_t serial) const {
+         const size_t i = index_of(serial);
+         return i == SIZE_MAX ? nullptr : &entries_[i];
+diff --git a/include/strata/core/conversation_file.hpp b/include/strata/core/conversation_file.hpp
+index 069ca24238f76ccd1fb50e82f36f1c4025a17b03..ad4805c5bd596e4761605673b9f86e8d3cc15f0c 100644
+--- a/include/strata/core/conversation_file.hpp
++++ b/include/strata/core/conversation_file.hpp
+@@ -8,6 +8,7 @@
+ #pragma once
+ 
+ #include "strata/core/conversation_cache.hpp"
++#include "strata/core/session_delta.hpp"   // kv-export: kSessionChunk, SessionKvChunks, SessionDelta, session_ids_fnv1a64
+ 
+ #include <array>
+ #include <cstddef>
+@@ -124,6 +125,8 @@ struct SessionStatus {
+     bool published = false;
+     // write (POSIX): this filesystem cannot flush a folder (fsync EINVAL); the save succeeded without that flush
+     bool dir_flush_unsupported = false;
++    // kv-export: write (streamed K/V): time inside the K/V sources' reads (device -> host) and inside the disk writes
++    double source_ms = 0, disk_ms = 0;
+ };
+ 
+ // Progress of a file transfer: (bytes done, bytes in the file).  A write reports once when its temporary file is
+@@ -151,6 +154,16 @@ struct SessionWriteOptions {
+     SessionPhase phase;
+     // tests: return an errno value to make a step fail ("write", "file_flush", "rename", "dir_flush"), 0 to go on
+     std::function<int(const char* step)> fault;
++    // kv-export: write these checkpoints (by reference, in this order) instead of the image's own list, so a save
++    // need not copy the deepest checkpoint (118 MB at this geometry) twice before writing it
++    std::optional<std::vector<const ConversationCheckpoint*>> checkpoints;
++    // kv-export: hand each full 16 MiB block to a writer thread and fill the next meanwhile (the disk then overlaps
++    // the hashing and the K/V reads); off when the second block cannot be allocated
++    bool write_behind = true;
++    // kv-export: out - the chunk hashes of every K/V part written (the whole parts, also in a delta save)
++    SessionKvChunks* kv_chunks = nullptr;
++    // kv-export: write a delta file against this base instead of a session file
++    const SessionDelta* delta = nullptr;
+ };
+ 
+ // Writes a temporary file beside `path` (a unique hidden name, created exclusively: never an existing file or link;
+@@ -179,6 +192,12 @@ bool session_file_write(const std::string& path, const SavedConversation& meta,
+                         const SessionFileIdentity& id, size_t& bytes, std::string& error,
+                         const SessionWriteOptions& options = {}, SessionStatus* status = nullptr);
+ 
++// kv-export: a parked conversation (a host image) to a file, keeping only the checkpoint a save keeps
++// (session_deepest_checkpoint) of its chain: the same file a SAVE of it as the live session would write.
++bool session_file_write_parked(const std::string& path, const SavedConversation& image, const SessionFileIdentity& id,
++                               size_t& bytes, std::string& error, const SessionWriteOptions& options = {},
++                               SessionStatus* status = nullptr);
++
+ // The checkpoints worth a disk write: the deepest one (the next turn's resume point when the live tail was
+ // rewritten).  Earlier checkpoints only serve edits further back and cost ~118 MB each at this geometry.
+ std::vector<ConversationCheckpoint> session_checkpoints_to_save(const std::vector<ConversationCheckpoint>& chain);
+diff --git a/include/strata/core/session_delta.hpp b/include/strata/core/session_delta.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..8d5a8ad4e63a1bc0b23f55c6d7c30eadb05893c8
+--- /dev/null
++++ b/include/strata/core/session_delta.hpp
+@@ -0,0 +1,42 @@
++// kv-export: incremental session saves and the conversation naming they share with the server - the public half of
++// the delta file format (STRSDLT v1) that conversation_file.cpp writes.  Pure host code: no CUDA.
++//
++// Kept out of conversation_file.hpp so an upstream merge meets one #include there and not the types themselves;
++// conversation_file.hpp includes this header, so every user of SessionWriteOptions sees them as before.  The writer's
++// own pieces (the delta header bytes, an image's K/V as sources, the keep checks, the chunk hasher) are private to
++// src/core (session_delta_file.hpp).  KV-EXPORT.md documents the file format byte by byte; it is a contract.
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++
++namespace strata::core {
++
++// kv-export: FNV-1a 64 over token ids as little-endian int32 - how SAVEC and the server (serve/server.py
++// fnv1a64_ids) name a conversation by its prompt.  {0, 1, -1, 151643} -> 0x2401b33d3e943579.
++inline uint64_t session_ids_fnv1a64(const int32_t* ids, size_t n) {
++    uint64_t h = 14695981039346656037ULL;
++    for (size_t i = 0; i < n; ++i) {
++        const uint32_t v = (uint32_t) ids[i];
++        for (int k = 0; k < 4; ++k) { h ^= (v >> (8 * k)) & 0xff; h *= 1099511628211ULL; }
++    }
++    return h;
++}
++
++// kv-export: incremental saves.  Every K/V part (k, v, k_scale, v_scale, pooled of each layer) is also described by
++// the session_hash64 (seed 0) of each kSessionChunk bytes of it (the last chunk may be shorter): a save can return
++// them, and a delta save against a base reuses the base's for the bytes it keeps.
++constexpr uint64_t kSessionChunk = 256u << 10;
++using SessionKvChunks = std::vector<std::array<std::vector<uint64_t>, 5>>;   // per K/V layer, per part
++// A delta file (STRSDLT v1) instead of a session file: each K/V part is written as (size, keep, the bytes from keep
++// on, the chunk hashes of the whole new part).  keep[layer][part] is a multiple of kSessionChunk (or 0) and at most the
++// part's size and the base's: the receiver rebuilds the session file from the base save it holds.
++struct SessionDelta {
++    uint64_t base = 0, id = 0;                    // the base save's id and this save's
++    std::vector<std::array<uint64_t, 5>> keep;   // per K/V layer
++    const SessionKvChunks* base_chunks = nullptr; // the base's chunk hashes: the first keep / kSessionChunk are reused
++};
++
++} // namespace strata::core
+diff --git a/include/strata/program/kv_export.hpp b/include/strata/program/kv_export.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..6f7b062edca16d65b6c7023573a1a2ae364672c9
+--- /dev/null
++++ b/include/strata/program/kv_export.hpp
+@@ -0,0 +1,378 @@
++// include/strata/program/kv_export.hpp - kv-export: the engine's side of moving a conversation between hosts
++// (header-only: generate.cpp is its one user, and its templates take generate.cpp's own types).
++//
++// Four commands on the engine's stdin, between requests, beside SAVE and RESTORE (KV-EXPORT.md documents them, the
++// session files and the delta files; all of it is a contract, byte for byte):
++//
++// IMPORT <path> reads a session file like RESTORE but parks it in the conversation cache
++// instead of replacing the live session, so a conversation replicated from another host waits for its
++// next turn without evicting this host's own, and the request path restores it as any parked one
++// (batch slots included).  Answers IMPORTED <tokens> <bytes> <ms>, or SERR as RESTORE does.
++//
++// SAVEC <slot|-1> <n> <hash> <path> saves one conversation by where it is: batch slot <slot>
++// (idle, still holding it) or the live session (-1), only if its first <n> tokens hash (FNV-1a 64 over
++// the int32 ids, 16 hex digits) to <hash> - the server names the conversation by the prompt it sent, so
++// a slot another conversation took meanwhile is refused instead of saved under the wrong name.
++//
++// SAVEX <slot|-1> <n> <hash> <base> <path> is SAVEC that also remembers what it wrote and, given
++// the id of an earlier SAVEX of the same conversation (<base>, 16 hex digits; 0: none), writes a delta file
++// (STRSDLT) against it when it can.  Answers SAVEDX <tokens> <bytes> <ms> <id> <base|0>.
++//
++// HELD <n> <hash> asks whether the engine still holds a conversation whose first <n> tokens
++// hash to <hash>, named as SAVEC names one: the live session, a batch slot (idle or decoding) or a parked
++// conversation.  Answers HELD <tokens>, the longest such conversation's length (0: none).  Read only:
++// nothing is moved, saved or touched, so a node can ask before every turn whether an IMPORT is needed.
++//
++// This header holds what stands on its own: the parsing and the answers, the HELD lookup, picking a batch slot as a
++// save's source, the save of a parked conversation, the IMPORT's parking, and the lineage store that lets a SAVEX
++// write a delta.  What is woven into upstream's SAVE / RESTORE handler in generate.cpp stays there, each piece marked
++// "kv-export": the save reading its source instead of the live session, the deepest checkpoint going into the file by
++// reference, the save's timing breakdown, and the refusals --batch no longer applies to SAVEC / IMPORT.
++#pragma once
++
++#include "strata/core/conversation_cache.hpp"
++#include "strata/core/conversation_file.hpp"
++#include "strata/kernels/qsa.hpp"
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <deque>
++#include <iterator>
++#include <new>
++#include <optional>
++#include <random>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace strata::core {
++struct SessionState;   // session.hpp
++struct QsaState;       // layer.hpp
++}
++
++namespace strata::program::kv_export {
++
++// ---- parsing ---------------------------------------------------------------------------------------------------
++
++// SAVEC / SAVEX: where the conversation is (a batch slot, or -1: the live session), how it is named (the FNV-1a 64 of
++// its first <n> token ids, session_ids_fnv1a64) and, for SAVEX, the id of the earlier save a delta may be written
++// against (0: none)
++struct SaveCommand {
++    long long slot = -1, n = 0;
++    unsigned long long hash = 0, base = 0;
++};
++
++// the conversation <ids> is the one named: its first <n> tokens hash to <hash>
++inline bool names(long long n, unsigned long long hash, const std::vector<int32_t>& ids) {
++    return n > 0 && (size_t) n <= ids.size() && strata::core::session_ids_fnv1a64(ids.data(), (size_t) n) == hash;
++}
++inline bool names(const SaveCommand& c, const std::vector<int32_t>& ids) { return names(c.n, c.hash, ids); }
++
++// what a save reads: the live session's tokens, pictures, checkpoints and state, or (SAVEC) an idle batch slot's
++struct SaveSource {
++    const std::vector<int32_t>* ids = nullptr;
++    const std::vector<strata::core::ConversationImageKey>* imgs = nullptr;
++    const std::vector<strata::core::ConversationCheckpoint>* checks = nullptr;
++    bool cvec = false, ok = false;
++    strata::core::SessionState* ss = nullptr;
++    const strata::core::QsaState* draft = nullptr;
++};
++
++// SAVEC of batch slot <c.slot>: the slot's conversation as the source, or false after refusing (a slot that is not
++// there, decoding, holds no complete conversation or has pictures).  `Slots` is generate.cpp's BSlot list, `SlotStates`
++// its per-stage, per-slot session states and `SlotDrafters` the per-slot MTP drafters (--batch-mtp).
++template <class Slots, class SlotStates, class SlotDrafters, class Refuse>
++bool slot_source(const SaveCommand& c, const Slots& bs, bool layer_split, const SlotStates& bslot_ss, bool batch_mtp,
++                 const SlotDrafters& slot_mtp, SaveSource& src, Refuse&& refuse) {
++    static const std::vector<strata::core::ConversationImageKey> no_imgs;
++    if (c.slot >= (long long) bs.size()) { refuse("no such batch slot"); return false; }
++    if (layer_split) { refuse("SAVEC of a batch slot does not support --layer-split"); return false; }
++    const auto& sl = bs[(size_t) c.slot];
++    if (sl.active) { refuse("the batch slot is decoding"); return false; }
++    if (!sl.cached || sl.partial || sl.tainted) { refuse("the batch slot holds no complete conversation"); return false; }
++    if (sl.img) { refuse("the batch slot's conversation has pictures"); return false; }
++    src.ids = &sl.ids;
++    src.imgs = &no_imgs;
++    src.checks = &sl.checks;
++    src.cvec = sl.cvec;
++    src.ok = true;
++    src.ss = bslot_ss[0][(size_t) c.slot].get();
++    // the slot's own drafter with --batch-mtp; else the solo drafter's K/V, which was built for another conversation:
++    // it only proposes drafts (the verifier decides), as when a slot goes back to the solo path
++    if (batch_mtp && (size_t) c.slot < slot_mtp.size()) src.draft = &slot_mtp[(size_t) c.slot]->kv_state();
++    return true;
++}
++
++// SAVEC <slot|-1> <n> <hash> <path> or SAVEX <slot|-1> <n> <hash> <base> <path>: the fields and the path (to the end
++// of the line), or false after answering the refusal
++inline bool parse_save(const std::string& line, bool savex, SaveCommand& c, std::string& path) {
++    int used = 0;
++    if (savex) {
++        if (std::sscanf(line.c_str() + 6, "%lld %lld %llx %llx %n", &c.slot, &c.n, &c.hash, &c.base, &used) != 4 ||
++            used <= 0) {
++            std::printf("SERR invalid 0 expected: SAVEX <slot|-1> <n> <hash> <base> <path>\n");
++            std::fflush(stdout);
++            return false;
++        }
++    } else {
++        if (std::sscanf(line.c_str() + 6, "%lld %lld %llx %n", &c.slot, &c.n, &c.hash, &used) != 3 || used <= 0) {
++            std::printf("SERR invalid 0 expected: SAVEC <slot|-1> <n> <hash> <path>\n");
++            std::fflush(stdout);
++            return false;
++        }
++    }
++    path = line.substr(6 + (size_t) used);
++    return true;
++}
++
++// The deepest checkpoint goes into a save's file by reference rather than through the view (which checks a checkpoint
++// it carries): so it is checked here as the view would - a prefix of the source's tokens and of their pictures, one
++// carve's state (`validate`: conversation_checkpoint_validate against the source's session state, called last).
++template <class Validate>
++bool deepest_fits(const SaveSource& src, const strata::core::ConversationCheckpoint& deepest, Validate&& validate) {
++    auto same_pictures = [&](const strata::core::ConversationCheckpoint& c) {
++        size_t k = 0;
++        for (const auto& key : *src.imgs) {
++            if ((uint64_t) key.start >= c.ids.size()) break;
++            if (k >= c.imgs.size() || !(c.imgs[k++] == key)) return false;
++        }
++        return k == c.imgs.size();
++    };
++    return !(!deepest.stage_parts.empty() || deepest.ids.empty() || !same_pictures(deepest) ||
++             deepest.ids.size() > src.ids->size() ||
++             !std::equal(deepest.ids.begin(), deepest.ids.end(), src.ids->begin()) || !validate(deepest));
++}
++
++// ---- HELD ------------------------------------------------------------------------------------------------------
++
++// HELD <n> <hash>: the longest conversation the engine holds under that name - the live session, a batch slot (idle
++// or decoding; `Slots` is generate.cpp's BSlot list) or a parked conversation - answered as HELD <tokens>.  Nothing is
++// moved, saved or touched.
++template <class Slots>
++void held(const std::string& line, bool live_ok, const std::vector<int32_t>& live, const Slots& bs,
++          const strata::core::ConversationCache& conversations) {
++    long long held_n = 0;
++    unsigned long long held_hash = 0;
++    if (std::sscanf(line.c_str() + 5, "%lld %llx", &held_n, &held_hash) != 2 || held_n <= 0) {
++        std::printf("SERR invalid 0 expected: HELD <n> <hash>\n");
++        std::fflush(stdout);
++        return;
++    }
++    auto named = [&](const std::vector<int32_t>& ids) { return names(held_n, held_hash, ids); };
++    size_t held = 0;
++    if (live_ok && live.size() > held && named(live)) held = live.size();
++    for (const auto& sl : bs)
++        if (sl.cached && !sl.partial && !sl.tainted && sl.ids.size() > held && named(sl.ids)) held = sl.ids.size();
++    for (size_t i = 0; i < conversations.size(); ++i) {
++        const auto& e = conversations.at(i);
++        if (e.live.ids.size() > held && named(e.live.ids)) held = e.live.ids.size();
++    }
++    std::printf("HELD %zu\n", held);
++    std::fflush(stdout);
++}
++
++// ---- incremental saves (SAVEX) ---------------------------------------------------------------------------------
++
++// Every SAVEX remembers what it wrote (a lineage: the tokens, the K/V layout and the chunk hashes of every K/V part),
++// so a later save of the same conversation can write a delta against it.  Kept bytes are the BASE's: a K/V cell before
++// the first token that differs from the base's tokens holds the same token's key and value (computed by an earlier
++// read: Strata's own retained-K/V reuse keeps such cells the same way).  Pictures or a control vector change what a
++// token's K/V means, so they always save in full.
++struct KvGeo {
++    int format = 0;
++    int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, idx_dim = 0;
++    std::array<uint64_t, 5> sizes{};
++    bool operator==(const KvGeo& b) const {   // the per-cell layout; cells and sizes may differ
++        return format == b.format && heads == b.heads && head_dim == b.head_dim && page_size == b.page_size &&
++               idx_dim == b.idx_dim;
++    }
++};
++struct SaveLineage {
++    uint64_t id = 0;
++    std::vector<int32_t> ids;
++    bool cvec = false, pictures = false;
++    std::vector<KvGeo> geo;
++    strata::core::SessionKvChunks chunks;
++};
++// one SAVEX on its way: the delta it writes (none: in full), the chunk hashes it writes and its new id
++struct SaveX {
++    std::optional<strata::core::SessionDelta> delta;
++    strata::core::SessionKvChunks chunks;
++    std::vector<KvGeo> geo;
++    uint64_t id = 0;
++};
++
++class SaveLineages {
++public:
++    static uint64_t new_save_id() {
++        static std::mt19937_64 rng{std::random_device{}() ^ ((uint64_t) std::random_device{}() << 32) ^
++                                   (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count()};
++        uint64_t v = 0;
++        while (!v) v = rng();
++        return v;
++    }
++    static std::vector<KvGeo> geo_of_sources(const std::vector<strata::core::SessionKvSource>& kv) {
++        std::vector<KvGeo> g;
++        for (const auto& k : kv) g.push_back({k.format, k.cells, k.heads, k.head_dim, k.page_size, k.idx_dim, {
++            k.sizes[0], k.sizes[1], k.sizes[2], k.sizes[3], k.sizes[4]}});
++        return g;
++    }
++    static std::vector<KvGeo> geo_of_image(const strata::core::SavedConversation& im) {
++        std::vector<KvGeo> g;
++        for (const auto& k : im.kv) g.push_back({k.format, k.cells, k.heads, k.head_dim, k.page_size, k.idx_dim, {
++            k.k.size(), k.v.size(), k.k_scale.size(), k.v_scale.size(), k.pooled.size()}});
++        return g;
++    }
++    // a delta against `base` for this conversation, or nothing (save in full): the bytes of every K/V part that
++    // hold the cells before the first token differing from the base's - whole pages, whole indexer rows, the
++    // draft one cell less (its last cell may not have been computed) - in whole chunks the base has too
++    void plan_delta(uint64_t base, const std::vector<int32_t>& ids, bool cvec, bool pictures,
++                    const std::vector<KvGeo>& geo, std::optional<strata::core::SessionDelta>& out) {
++        out.reset();
++        if (!base || pictures) return;
++        auto it = std::find_if(lineages_.begin(), lineages_.end(), [&](const SaveLineage& l) { return l.id == base; });
++        if (it == lineages_.end() || it->pictures || it->cvec != cvec || it->geo.size() != geo.size()) return;
++        for (size_t j = 0; j < geo.size(); ++j) if (!(it->geo[j] == geo[j])) return;
++        const size_t common = (size_t) (std::mismatch(ids.begin(), ids.begin() + (ptrdiff_t) std::min(ids.size(), it->ids.size()),
++                                                      it->ids.begin()).first - ids.begin());
++        const int64_t idx_block = strata::kernels::qsa_real_shapes().idx_block;
++        strata::core::SessionDelta d;
++        d.base = base;
++        d.base_chunks = &it->chunks;
++        d.keep.assign(geo.size(), {});
++        for (size_t j = 0; j < geo.size(); ++j) {
++            const bool draft = j + 1 == geo.size();
++            const int64_t u = std::max<int64_t>(0, (int64_t) common - (draft ? 1 : 0));
++            const KvGeo& n = geo[j];
++            for (size_t p = 0; p < 5; ++p) {
++                uint64_t keep = 0;
++                if (p < 4) {
++                    const int64_t whole = n.page_size > 0 ? u / n.page_size * n.page_size : 0;
++                    if (n.cells > 0) keep = n.sizes[p] / (uint64_t) n.cells * (uint64_t) whole;
++                } else if (!draft && idx_block > 0) {
++                    keep = (uint64_t) (u / idx_block) * (uint64_t) n.idx_dim * 4;
++                }
++                keep = std::min({keep, n.sizes[p], it->geo[j].sizes[p]});
++                keep = keep / strata::core::kSessionChunk * strata::core::kSessionChunk;
++                keep = std::min<uint64_t>(keep, it->chunks[j][p].size() * strata::core::kSessionChunk);
++                d.keep[j][p] = keep;
++            }
++        }
++        out = std::move(d);
++    }
++    void remember(uint64_t id, const std::vector<int32_t>& ids, bool cvec, bool pictures,
++                  std::vector<KvGeo>&& geo, strata::core::SessionKvChunks&& chunks) {
++        lineages_.push_back({id, ids, cvec, pictures, std::move(geo), std::move(chunks)});
++        while (lineages_.size() > kLineages) lineages_.pop_front();
++    }
++    void touch(uint64_t id) {   // a base used again stays (most recently used last)
++        auto it = std::find_if(lineages_.begin(), lineages_.end(), [&](const SaveLineage& l) { return l.id == id; });
++        if (it != lineages_.end() && std::next(it) != lineages_.end()) {
++            SaveLineage l = std::move(*it);
++            lineages_.erase(it);
++            lineages_.push_back(std::move(l));
++        }
++    }
++    // a SAVEX about to write: its geometry, the delta against `base` when there can be one, a new id, and the write
++    // options that write that delta and hand back the chunk hashes
++    void prepare(SaveX& x, uint64_t base, const std::vector<int32_t>& ids, bool cvec, bool pictures,
++                 std::vector<KvGeo>&& geo, strata::core::SessionWriteOptions& wo) {
++        x.geo = std::move(geo);
++        plan_delta(base, ids, cvec, pictures, x.geo, x.delta);
++        x.id = new_save_id();
++        if (x.delta) { x.delta->id = x.id; wo.delta = &*x.delta; }
++        wo.kv_chunks = &x.chunks;
++    }
++    // a save written: SAVEX remembers it (and keeps its base) and answers SAVEDX <tokens> <bytes> <ms> <id> <base|0>;
++    // SAVEC answers SAVED <tokens> <bytes> <ms>.  `ms` is read when the answer is printed.
++    template <class Ms>
++    void answer(bool savex, SaveX& x, uint64_t base, const std::vector<int32_t>& ids, bool cvec, bool pictures,
++                size_t bytes, Ms&& ms) {
++        if (savex) {
++            if (x.delta) touch(base);
++            remember(x.id, ids, cvec, pictures, std::move(x.geo), std::move(x.chunks));
++            std::printf("SAVEDX %zu %zu %.1f %016llx %016llx\n", ids.size(), bytes, ms(),
++                        (unsigned long long) x.id, (unsigned long long) (x.delta ? base : 0));
++        } else {
++            std::printf("SAVED %zu %zu %.1f\n", ids.size(), bytes, ms());
++        }
++    }
++private:
++    std::deque<SaveLineage> lineages_;   // most recently used last
++    static constexpr size_t kLineages = 64;   // at least the last two saves of each of 32 sessions
++};
++
++// ---- SAVEC / SAVEX of a parked conversation ----------------------------------------------------------------------
++
++// The live session moved on (another conversation's request took it and parked this one): save the longest parked
++// conversation it names, straight from RAM.  The file is the one a SAVE of it as the live session writes (only the
++// deepest checkpoint).  A batch slot's conversation (slot >= 0) is never looked for among the parked ones.  Answers
++// as the save does, or refuses through generate.cpp's `refuse` (which prints SERR).
++template <class Refuse, class Ms>
++void save_parked(const std::string& path, const SaveCommand& c, bool savex,
++                 const strata::core::ConversationCache& conversations, SaveLineages& lineages,
++                 const strata::core::SessionFileIdentity& id, std::string& err, uint64_t min_free_bytes,
++                 strata::core::SessionProgress progress, strata::core::SessionPhase phase, Refuse&& refuse, Ms&& ms) {
++    const strata::core::SavedConversation* parked = nullptr;
++    for (size_t i = 0; c.slot < 0 && i < conversations.size(); ++i) {
++        const auto& e = conversations.at(i);
++        if (e.stage_images.empty() && e.live.imgs.empty() && names(c, e.live.ids) &&
++            (!parked || e.live.ids.size() > parked->live.ids.size())) parked = &e;
++    }
++    if (!parked) { refuse("that conversation is no longer held there"); return; }
++    size_t bytes = 0;
++    strata::core::SessionWriteOptions wo;
++    wo.min_free_bytes = min_free_bytes;
++    wo.progress = std::move(progress);
++    wo.phase = std::move(phase);
++    strata::core::SessionStatus st;
++    SaveX x;
++    if (savex)
++        lineages.prepare(x, c.base, parked->live.ids, parked->cvec, !parked->live.imgs.empty(),
++                         SaveLineages::geo_of_image(*parked), wo);
++    try {
++        if (!strata::core::session_file_write_parked(path, *parked, id, bytes, err, wo, &st)) {
++            refuse(err, st.error, st.published);
++            return;
++        }
++    } catch (const std::bad_alloc&) {
++        refuse("not enough RAM to save the session", strata::core::SessionError::memory);
++        return;
++    }
++    std::fprintf(stderr, "strata serve: session saved %zu tokens (parked%s), %zu bytes to %s in "
++                 "%.1f ms (disk %.1f ms)\n", parked->live.ids.size(), x.delta ? ", delta" : "", bytes,
++                 path.c_str(), ms(), st.disk_ms);
++    lineages.answer(savex, x, c.base, parked->live.ids, parked->cvec, !parked->live.imgs.empty(), bytes, ms);
++    std::fflush(stdout);
++}
++
++// ---- IMPORT ----------------------------------------------------------------------------------------------------
++
++// A session file read and validated like RESTORE, parked in the conversation cache instead of replacing the live
++// session: host memory only (the device state, the live session and the batch slots are untouched).  Answers
++// IMPORTED <tokens> <bytes> <ms>, or refuses through generate.cpp's `refuse`.
++template <class Refuse, class Ms>
++void park_import(strata::core::SavedConversation& image, size_t bytes, double read_ms, const std::string& path,
++                 strata::core::ConversationCache& conversations, Refuse&& refuse, Ms&& ms) {
++    const size_t tokens = image.live.ids.size(), held = image.bytes();
++    if (!conversations.wants((int64_t) tokens)) {
++        refuse("shorter than --conversation-cache-min-tokens");
++        return;
++    }
++    if (!conversations.put(std::move(image))) {
++        refuse("no room in the conversation cache (--conversation-cache-mib / -slots)",
++               strata::core::SessionError::memory);
++        return;
++    }
++    std::fprintf(stderr, "strata serve: session imported %zu tokens, %zu bytes (%zu in RAM) from %s "
++                 "in %.1f ms (read+check %.1f ms); parked=%zu bytes=%zu evictions=%zu\n", tokens,
++                 bytes, held, path.c_str(), ms(), read_ms, conversations.size(),
++                 conversations.bytes(), conversations.evictions());
++    std::printf("IMPORTED %zu %zu %.1f\n", tokens, bytes, ms());
++    std::fflush(stdout);
++}
++
++} // namespace strata::program::kv_export
+diff --git a/serve/kv_export.py b/serve/kv_export.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..24b3607aa64b8e73c09bc15dbd98adf8b2c4a10f
+--- /dev/null
++++ b/serve/kv_export.py
+@@ -0,0 +1,316 @@
++"""kv-export: a conversation's KV state moved between Strata processes - the Python half.
++
++Everything the server adds for kv-export lives here; serve/server.py keeps only the hooks (KV-EXPORT.md has the whole
++API and the formats, which are a contract: the engine's lines, the HTTP answers and the files do not change).
++
++    the session memory       KV_SESSION (the client session of the request a thread serves), kv_session_id(), and
++                             KvExport.kv_note(): each session's last prompt, packed, for a save by session
++    the engine's lines       session_command() / session_answer(): SAVEC, SAVEX, IMPORT and HELD and their answers,
++                             for StrataEngine.session_file (its third argument, `conv`)
++    the endpoints            KvExport: POST /slots/session?action=save|held and POST /slots/0?action=import, mixed
++                             into server.Service
++
++This module imports nothing from serve.server: server.py imports it (and may run as a script, as __main__, where
++`import serve.server` would load a second copy whose SessionRefused the engine never raises).  server.py hands over
++the two names the endpoints need with bind(), right before `class Service(kv_export.KvExport)`.
++"""
++from __future__ import annotations
++
++import array
++import collections
++import math
++import os
++import sys
++import threading
++import time
++
++# set by bind() (server.py): its SessionRefused and slot_filename_problem
++SessionRefused = None
++slot_filename_problem = None
++
++
++def bind(refused_type, filename_problem) -> None:
++    """server.py's SessionRefused and slot_filename_problem, for the KvExport methods."""
++    global SessionRefused, slot_filename_problem
++    SessionRefused, slot_filename_problem = refused_type, filename_problem
++
++
++# kv-export: the client session of the request this thread serves (X-Session-Id / X-Session-Affinity), so the
++# conversation it ends in can be saved by name afterwards (POST /slots/session?action=save)
++KV_SESSION = threading.local()
++KV_SESSIONS_KEPT = 1024
++KV_SESSIONS_BYTES = 64 << 20    # their prompts, packed int32: 64 MiB is ~16M tokens (~320 conversations of 50k)
++
++
++def kv_session_id(headers) -> str | None:
++    # the order viiwork routes by (internal/proxy sessionKey): X-Session-Affinity, then X-Session-Id
++    # (the first non-empty one as it stands, like viiwork; one with spaces or controls names no session)
++    sid = headers.get("X-Session-Affinity") or headers.get("X-Session-Id") or ""
++    # a longer id is no session (never cut short: two ids that start alike would share one remembered prompt)
++    return sid if sid and len(sid) <= 256 and all(32 < ord(c) < 127 for c in sid) else None
++
++
++def fnv1a64_ids(ids) -> int:
++    """kv-export: FNV-1a 64 over the token ids as little-endian int32, as the engine's SAVEC computes it."""
++    data = (ids if isinstance(ids, array.array) and ids.typecode == "i" else array.array("i", ids)).tobytes()
++    if sys.byteorder != "little":
++        a = array.array("i", data)
++        a.byteswap()
++        data = a.tobytes()
++    h = 0xcbf29ce484222325
++    for b in data:
++        h = ((h ^ b) * 0x100000001b3) & 0xffffffffffffffff
++    return h
++
++
++# the answers session_answer() reads; SAVED, RESTORED and IMPORTED are the engine's plain session answers
++SESSION_ANSWERS = ("HELD", "SAVEDX")
++
++
++def session_command(action: str, path: str, conv: tuple | None = None) -> tuple[str, str]:
++    """StrataEngine.session_file's line to the engine and the answer it waits for: (command line, answer head).
++    SAVE / RESTORE as upstream, and kv-export's IMPORT, SAVEC, SAVEX and HELD.  ValueError("invalid session command")
++    for anything else, before a line is written."""
++    if action not in ("save", "restore", "import", "held") or any(c in path for c in "\r\n\0"):
++        raise ValueError("invalid session command")
++    if conv is not None and action not in ("save", "held") or action == "held" and (conv is None or len(conv) != 2):
++        raise ValueError("invalid session command")
++    # kv-export: `conv` = (where, n, hash): SAVEC saves the conversation whose first n ids hash to `hash`
++    # (fnv1a64_ids) from batch slot `where` (or the live session, -1, else a parked one), and the engine refuses
++    # if it is no longer held there
++    # (where, n, hash, base): SAVEX - the same, remembered by the engine, and a delta file against the earlier
++    # SAVEX `base` (0: none) when it can; the answer adds "save_id" and "base" (None: a full session file)
++    # (n, hash) with "held": HELD - the length of the longest conversation the engine still holds (live, a batch
++    # slot or parked) whose first n ids hash to `hash`, 0 for none; read only, `path` unused
++    if action == "held":
++        cmd = f"HELD {int(conv[0])} {int(conv[1]):016x}\n"
++    elif conv is None:
++        cmd = f"{action.upper()} {path}\n"
++    elif len(conv) == 4:
++        cmd = f"SAVEX {int(conv[0])} {int(conv[1])} {int(conv[2]):016x} {int(conv[3]):016x} {path}\n"
++    else:
++        cmd = f"SAVEC {int(conv[0])} {int(conv[1])} {int(conv[2]):016x} {path}\n"
++    want = {"save": "SAVED", "restore": "RESTORED", "import": "IMPORTED", "held": "HELD"}[action]
++    if conv is not None and len(conv) == 4:
++        want = "SAVEDX"
++    return cmd, want
++
++
++def session_answer(want: str, f: list, count) -> dict:
++    """The answer `want` (one of SESSION_ANSWERS), split into fields `f`: HELD <n> -> {"tokens"}; SAVEDX <tokens> <bytes>
++    <ms> <save_id> <base> -> {"tokens", "bytes", "ms", "save_id", "base"} (base None: a full session file).  `count` is
++    session_file's strict digit reader.  ValueError when malformed: the caller ends the engine (out of step)."""
++    if want == "HELD":
++        if len(f) != 2:
++            raise ValueError
++        return {"tokens": count(f[1])}
++    if len(f) != 6:
++        raise ValueError
++    tokens, size, ms = count(f[1]), count(f[2]), float(f[3])
++    if not math.isfinite(ms) or ms < 0:
++        raise ValueError
++    out = {"tokens": tokens, "bytes": size, "ms": ms}
++    if not all(len(x) == 16 and all(c in "0123456789abcdef" for c in x) for x in f[4:6]):
++        raise ValueError
++    out["save_id"], out["base"] = f[4], (f[5] if int(f[5], 16) else None)
++    return out
++
++
++class KvExport:
++    """kv-export's endpoints, mixed into server.Service (they use its engine, FIFO, status and slot_save_path).
++    Service.slot_action dispatches to them: /slots/session to session_save (and session_held), action=import on slot
++    0 to session_import; Service.stream() calls kv_note() with each request's session and prompt."""
++
++    def session_save(self, action, filename, session, error, base=None, conv=None) -> tuple[int, dict]:
++        """kv-export: POST /slots/session?action=save {"session": ID, "filename": NAME} saves the conversation the
++        client session ID last continued (its requests carried X-Session-Id or X-Session-Affinity), wherever it is now:
++        the batch slot that holds it, else the live session, else (the engine looks) the conversation cache, where a
++        later request of another session parked it.  With parallel requests it takes the control lines like
++        an admission.  409 when that conversation is no longer held (another took its slot)."""
++        if action == "held":
++            return self.session_held(session, error, conv)
++        if action != "save":
++            return error(400, "/slots/session supports action=save and action=held")
++        why = slot_filename_problem(filename)
++        if why:
++            return error(400, f"filename {why}")
++        with self.status_lock:
++            ids = (self.__dict__.get("kv_sessions") or {}).get(session) if isinstance(session, str) else None
++        if not ids:
++            return error(404, "no request of that session on this server")
++        if base is not None and not (isinstance(base, str) and len(base) == 16 and
++                                     all(c in "0123456789abcdef" for c in base)):
++            return error(400, "base must be a save_id: 16 lowercase hex digits")
++        base_id = int(base, 16) if base else 0
++        path = os.path.join(self.slot_save_path, filename)
++        name = fnv1a64_ids(ids)                         # ~36 ms per 50k tokens: before the control lines, not inside
++        found = {"where": -1}
++
++        def save(eng):
++            if not getattr(eng, "batch", 0):
++                conv = (-1, len(ids), name, base_id)
++                if getattr(eng, "session_save_reclaim", False):
++                    from serve.session_save_retry import session_file
++                    return session_file(self, "save", path, SessionRefused, conv=conv)
++                return eng.session_file("save", path, conv)
++            with eng.slot_cv:                               # the idle slot holding the longest start with these ids
++                held = 0
++                for b in range(eng.batch):
++                    h = eng.slot_held[b]
++                    if (not eng.slot_busy[b] and len(h) >= len(ids) and len(h) > held and
++                            array.array("i", h[:len(ids)]) == ids):
++                        found["where"], held = b, len(h)
++            return self.with_control(lambda: eng.session_file("save", path, (found["where"], len(ids), name, base_id)))
++        try:
++            r = self.session_op("save", save)
++        except SessionRefused as e:
++            # the engine refuses a well-formed SAVEC/SAVEX ("invalid") only for the state of that conversation: no
++            # longer held, decoding, partial, pictures - a conflict with what the engine holds now, not a bad request
++            body = error(409 if e.kind == "invalid" else e.status, str(e))
++            body[1]["error"]["kind"] = e.kind
++            return body
++        except ValueError as e:
++            return error(400, str(e))
++        if r is None:
++            return error(503, "the model is not loaded")
++        where = found["where"]
++        return 200, {"id_slot": where, "session": session, "filename": filename, "n_saved": r["tokens"],
++                     "n_written": r["bytes"], "timings": {"save_ms": r["ms"]}, "save_id": r["save_id"],
++                     "base": r["base"], "delta": r["base"] is not None}
++
++    def session_held(self, session, error, conv=None) -> tuple[int, dict]:
++        """kv-export: POST /slots/session?action=held {"session": ID} -> {"session", "n_held"}: how many tokens of
++        the conversation client session ID last continued the engine still holds (live, in a batch slot or parked;
++        the longest one that starts with that session's last prompt here), 0 when none or when this server never
++        saw the session.  With {"n": N, "hash": "<16 hex>"} it asks for the conversation whose first N ids hash to
++        that (fnv1a64_ids) instead - a replica's own ids, which the session's last prompt here may not start: after
++        a compaction elsewhere this server's copy of the session is another branch.  Read only, so a node asks
++        before each turn whether to import its replica: the conversation cache evicts oldest first and says
++        nothing about which.  With parallel requests it takes the control lines between two admissions, as a
++        save does."""
++        n, h = conv if conv else (None, None)
++        if n is not None or h is not None:
++            if (isinstance(n, bool) or not isinstance(n, int) or n <= 0 or not isinstance(h, str) or len(h) != 16 or
++                    not all(c in "0123456789abcdef" for c in h)):
++                return error(400, "n must be a positive token count and hash 16 lowercase hex digits")
++            conv = (n, int(h, 16))
++        else:
++            with self.status_lock:
++                ids = (self.__dict__.get("kv_sessions") or {}).get(session) if isinstance(session, str) else None
++            if not ids:
++                return 200, {"session": session, "n_held": 0}
++            conv = (len(ids), fnv1a64_ids(ids))
++
++        def held(eng):
++            if not getattr(eng, "batch", 0):
++                return eng.session_file("held", "", conv)
++            return self.with_control(lambda: eng.session_file("held", "", conv))
++        try:
++            r = self.session_op("held", held)
++        except SessionRefused as e:
++            body = error(e.status, str(e))
++            body[1]["error"]["kind"] = e.kind
++            return body
++        if r is None:
++            return error(503, "the model is not loaded")
++        return 200, {"session": session, "n_held": r["tokens"]}
++
++    def kv_note(self, sid, ids) -> None:
++        """kv-export: the conversation client session `sid` continues starts with these ids (the last
++        KV_SESSIONS_KEPT sessions, at most KV_SESSIONS_BYTES of ids), for POST /slots/session?action=save."""
++        if not sid:
++            return
++        packed = array.array("i", ids)              # 4 bytes a token (a list of ints is ~36)
++        with self.status_lock:
++            kept = self.__dict__.setdefault("kv_sessions", collections.OrderedDict())
++            old = kept.pop(sid, None)
++            self.kv_sessions_bytes = self.__dict__.get("kv_sessions_bytes", 0) + packed.itemsize * len(packed) - \
++                (old.itemsize * len(old) if old is not None else 0)
++            kept[sid] = packed
++            # the oldest sessions go first; the newest stays even when it alone is over the budget
++            while len(kept) > 1 and (len(kept) > KV_SESSIONS_KEPT or self.kv_sessions_bytes > KV_SESSIONS_BYTES):
++                _, gone = kept.popitem(last=False)
++                self.kv_sessions_bytes -= gone.itemsize * len(gone)
++
++    def session_op(self, action, fn):
++        """kv-export: fn(engine) for a save by session or an import, with the bookkeeping slot_action keeps: counted
++        as queued while it waits, under the FIFO (so an unload, idle or asked for, waits for it: parallel requests do
++        not hold the FIFO, but unload() takes it), the engine checked as loaded once the FIFO is held, and the idle
++        timer told before and after.  None when the model is not loaded."""
++        self.last_request_at = time.time()
++        with self.status_lock:
++            self.status["queued"] += 1
++        waiting = True
++        try:
++            with self.fifo:
++                with self.status_lock:
++                    self.status["queued"] -= 1
++                waiting = False
++                if not self.loaded():
++                    return None
++                # with parallel requests "busy" is theirs to set; a held check is a lookup, not work
++                solo = not getattr(self.engine, "batch", 0) and action != "held"
++                if solo:
++                    with self.status_lock:
++                        self.status.update(busy=True, phase={"save": "saving the session",
++                                           "import": "importing a session",
++                                           "held": "checking a session"}[action], started=time.time(),
++                                           first_token=None, prompt_tokens=None, generated=None, max_tokens=None)
++                try:
++                    return fn(self.engine)
++                finally:
++                    if solo:
++                        with self.status_lock:
++                            self.status["busy"] = False
++                    self.last_request_at = time.time()
++        finally:
++            if waiting:
++                with self.status_lock:
++                    self.status["queued"] -= 1
++
++    def with_control(self, fn):
++        """kv-export: fn() while holding the engine's control lines, as an admission does (parallel requests only):
++        a session command between two admissions, never inside one.  The slots keep decoding meanwhile."""
++        eng = self.engine
++        for _ in eng._take_control(threading.Event(), 0):  # heartbeats while an admission holds the lines
++            pass
++        eng._ctl_held = True                    # session_file() below must not wait for the lines this call holds
++        try:
++            return fn()
++        finally:
++            eng._ctl_held = False
++            eng.ctl.release()
++            with eng.slot_cv:
++                eng.slot_cv.notify_all()
++
++    def session_import(self, filename, error) -> tuple[int, dict]:
++        """kv-export: POST /slots/0?action=import {"filename": NAME}: the engine parks the file in its conversation
++        cache (it never touches the live session or a slot).  With parallel requests it only needs the control lines,
++        not the FIFO; without, it is a session command under the FIFO like a restore (slot_action's own path for save
++        and restore: the same checks, the same phase, the same answers - "published" too, as there)."""
++        why = slot_filename_problem(filename)
++        if why:
++            return error(400, f"filename {why}")
++        path = os.path.join(self.slot_save_path, filename)
++        try:
++            os.lstat(path)                                  # the engine opens it without following a link
++        except OSError:
++            return error(404, f"no saved session named {filename}")
++        batch = getattr(self.engine, "batch", 0)
++        try:
++            if batch:
++                r = self.session_op("import", lambda eng: self.with_control(lambda: eng.session_file("import", path)))
++            else:
++                r = self.session_op("import", lambda eng: eng.session_file("import", path))
++        except SessionRefused as e:
++            body = error(e.status, str(e))
++            body[1]["error"]["kind"] = e.kind
++            if e.published and not batch:
++                body[1]["error"]["published"] = True
++            return body
++        except ValueError as e:
++            return error(400, str(e))
++        if r is None:
++            return error(503, "the model is not loaded")
++        return 200, {"id_slot": 0, "filename": filename, "n_imported": r["tokens"], "n_read": r["bytes"],
++                     "timings": {"import_ms": r["ms"]}}
+diff --git a/serve/server.py b/serve/server.py
+index 2bffac115f82d5bdb171922b4f6364a810046209..30ad93d5692bc800d79ff62cfb94ff1e36e90240 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -86,6 +86,9 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
+ from serve import responses as responses_api  # noqa: E402
+ from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
+ from serve import images as images_api  # noqa: E402
++from serve import kv_export  # noqa: E402
++from serve.kv_export import (KV_SESSION, KV_SESSIONS_KEPT, SESSION_ANSWERS, fnv1a64_ids,  # noqa: E402,F401
++                             kv_session_id, session_answer, session_command)
+ 
+ IM_END = "<|im_end|>"
+ IMAGE_PAD = "<|image_pad|>"
+@@ -2990,11 +2993,11 @@ class StrataEngine:
+         except (OSError, AttributeError, subprocess.TimeoutExpired):
+             pass
+ 
+-    def session_file(self, action: str, path: str) -> dict:
++    def session_file(self, action: str, path: str, conv: tuple | None = None) -> dict:
+         with self._exclusive_control():
+-            return self._session_file(action, path)
++            return self._session_file(action, path, conv)
+ 
+-    def _session_file(self, action: str, path: str) -> dict:
++    def _session_file(self, action: str, path: str, conv: tuple | None = None) -> dict:
+         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
+         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
+         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
+@@ -3006,16 +3009,15 @@ class StrataEngine:
+         a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
+         explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
+         that never ends is still ended."""
+-        if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
+-            raise ValueError("invalid session command")
++        cmd, want = session_command(action, path, conv)    # kv-export: SAVEC, SAVEX, IMPORT, HELD (serve/kv_export.py)
+         try:
+-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+-            self.proc.stdin.flush()
++            with getattr(self, "wlock", None) or contextlib.nullcontext():
++                self.proc.stdin.write(cmd)
++                self.proc.stdin.flush()
+         except OSError:
+             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+         silence = float(self.silence_s or 0)
+         heard = time.monotonic()
+-        want = "SAVED" if action == "save" else "RESTORED"
+ 
+         def out_of_step(line: str) -> EngineDied:
+             self.ended = True                               # not alive from now: the next request restarts it
+@@ -3078,6 +3080,11 @@ class StrataEngine:
+                 if len(parts) != 4 or parts[1] not in SessionRefused.STATUS or parts[2] not in ("0", "1"):
+                     raise out_of_step(line)
+                 raise SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
++            if head == want and want in SESSION_ANSWERS:   # kv-export: HELD, SAVEDX (serve/kv_export.py)
++                try:
++                    return session_answer(want, f, count)
++                except ValueError:
++                    raise out_of_step(line) from None
+             if head == want:
+                 try:
+                     if len(f) != 4:
+@@ -4720,7 +4727,10 @@ def slot_save_dir(value, base: str | None = None) -> str:
+         raise ValueError(f"slot_save_path {path} is not a directory")
+     return path
+ 
+-class Service:
++kv_export.bind(SessionRefused, slot_filename_problem)   # kv-export: the Service methods in serve/kv_export.py
++
++
++class Service(kv_export.KvExport):
+     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
+                  vision: Vision | None = None, sampling_defaults: dict | None = None,
+                  fit_max_tokens: bool = True):
+@@ -4958,7 +4968,7 @@ class Service:
+             cancel.set()
+         return len(active)
+ 
+-    def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
++    def slot_action(self, slot: str, action: str, filename, session=None, base=None, conv=None) -> tuple[int, dict]:
+         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
+         to or from a file in slot_save_path.  -> (HTTP status, body)."""
+         def error(code, message):
+@@ -4966,6 +4976,10 @@ class Service:
+                                     "type": "invalid_request_error" if code < 500 else "server_error"}}
+         if not self.slot_save_path or not hasattr(self.engine, "session_file"):
+             return error(501, "slot save/restore is disabled (start the server with --slot-save-path DIR)")
++        if slot == "session":
++            return self.session_save(action, filename, session, error, base, conv)
++        if action == "import" and slot == "0":
++            return self.session_import(filename, error)
+         if getattr(self.engine, "batch", 0):
+             # #465 parallel requests do not hold the FIFO and share the engine's control lines: a session file
+             # could interleave with a request being admitted, so the two are not combined (the engine refuses too)
+@@ -4973,7 +4987,7 @@ class Service:
+         if slot != "0":
+             return error(400, "this server has one slot: 0")
+         if action not in ("save", "restore"):
+-            return error(400, "action must be save or restore")
++            return error(400, "action must be save, restore or import")
+         why = slot_filename_problem(filename)
+         if why:
+             return error(400, f"filename {why}")
+@@ -6156,6 +6170,7 @@ class Service:
+              declared_only=False, deferred=False) -> Iterator[tuple[str, object]]:
+         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
+         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
++        self.kv_note(getattr(KV_SESSION, "sid", None), ids)
+         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
+         # apps; the request's own fields win over all of them
+         defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
+@@ -8239,13 +8254,15 @@ def make_handler(svc: Service):
+                     return
+                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                     self.record = svc.begin_request(path, req)
++                KV_SESSION.sid = kv_session_id(self.headers)
+                 if path == "/v1/responses":
+                     self._responses(req)
+                 elif path.startswith("/slots/"):
+                     query = parse_qs(self.path.partition("?")[2])
+                     try:
+                         code, body = svc.slot_action(path[len("/slots/"):], (query.get("action") or [""])[0],
+-                                                     req.get("filename"))
++                                                     req.get("filename"), req.get("session"), req.get("base"),
++                                                     (req.get("n"), req.get("hash")))
+                     except EngineDied as e:                  # EngineSilent included: the engine was ended
+                         code, body = 500, {"error": {"code": 500, "message": str(e) + "; the next request starts "
+                                                      "the engine again", "type": "server_error"}}
+diff --git a/serve/session_save_retry.py b/serve/session_save_retry.py
+index 2e9368add8f1b27a7ed0f54d88d3c0cd720167d7..183da2404ec53d8f38f3a2827c567763fd289f5e 100644
+--- a/serve/session_save_retry.py
++++ b/serve/session_save_retry.py
+@@ -37,12 +37,13 @@ def retryable(action, error) -> bool:
+             and required_mib(error) is not None)
+ 
+ 
+-def session_file(service, action, path, refused_type):
+-    """Called only when --session-save-reclaim is enabled; never changes RESTORE."""
++def session_file(service, action, path, refused_type, conv=None):
++    """Called only when --session-save-reclaim is enabled; never changes RESTORE.  conv: kv-export's save by session
++    (engine.session_file's third argument), passed through on every try."""
+     engine = service.engine
+     process = getattr(engine, 'proc', None)
+     try:
+-        return engine.session_file(action, path)
++        return (engine.session_file(action, path) if conv is None else engine.session_file(action, path, conv))
+     except refused_type as error:
+         if not retryable(action, error) or process is None:
+             raise
+@@ -73,7 +74,7 @@ def session_file(service, action, path, refused_type):
+             if not same_process():
+                 raise last_error
+             try:
+-                return engine.session_file(action, path)
++                return (engine.session_file(action, path) if conv is None else engine.session_file(action, path, conv))
+             except refused_type as failure:
+                 if not retryable(action, failure):
+                     raise
+diff --git a/serve/test_kv_export.py b/serve/test_kv_export.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..63737a0088c28ecf0700a38ce0273190e1691e9b
+--- /dev/null
++++ b/serve/test_kv_export.py
+@@ -0,0 +1,433 @@
++"""serve/test_kv_export.py - kv-export: POST /slots/session?action=save (SAVEC) and POST /slots/0?action=import (IMPORT),
++solo and with parallel requests (mock engine: no GPU, no pack).
++
++    python -m unittest serve.test_kv_export -v
++"""
++from __future__ import annotations
++
++import collections
++import json
++import queue
++import sys
++import tempfile
++import threading
++import unittest
++import urllib.error
++import urllib.request
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++from serve.frontend import ChatTemplate  # noqa: E402
++from serve import kv_export, server  # noqa: E402
++from serve.server import (KV_SESSIONS_KEPT, ByteTokenizer, Service, StrataEngine, fnv1a64_ids,  # noqa: E402
++                          kv_session_id, serve)
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++class FakeProc:
++    """Answers SAVEC / IMPORT / SAVE / RESTORE lines like `strata --serve` does."""
++
++    def __init__(self, engine):
++        self.engine = engine
++        self.stdin = self
++        self.sent: list[str] = []
++
++    def write(self, s):
++        self.sent.append(s.strip())
++        cmd, _, rest = s.strip().partition(" ")
++        e = self.engine
++        if e.during:                                # what the server allows while the engine works on this line
++            e.during()
++        if e.refuse:
++            e.lines.put(f"SERR {e.refuse_kind} 0 {e.refuse}\n")
++        elif cmd == "SAVEX":
++            slot, n, h, base, path = rest.split(" ", 4)
++            Path(path).write_bytes(b"s" * 100)
++            # the engine knows base 00000000000000aa only: a delta against it, else a full save
++            e.lines.put(f"SAVEDX {n} 100 12.5 {e.next_id} {base if base == '00000000000000aa' else '0' * 16}\n")
++        elif cmd == "HELD":
++            n, h = rest.split(" ")
++            e.lines.put(f"HELD {e.held.get((int(n), h), 0)}\n")
++        elif cmd == "IMPORT":
++            e.lines.put("IMPORTED 50000 1000 1500.0\n")
++        elif cmd == "SAVE":
++            Path(rest).write_bytes(b"x" * 10)
++            e.lines.put("SAVED 7 10 1.0\n")
++
++    def flush(self):
++        pass
++
++    def poll(self):
++        return None
++
++
++class FakeEngine(StrataEngine):
++    def __init__(self):
++        super().__init__("strata", ["--max-context", "65536"], lazy=True)
++        self.max_context = 65536
++        self.ended = False
++        self.lines = queue.Queue()
++        self.refuse = None
++        self.refuse_kind = "invalid"
++        self.during = None
++        self.next_id = "00000000000000bb"
++        self.held = {}                              # HELD: (n, hash hex) -> tokens the engine says it holds
++        self.silence_s = 30.0
++        self.proc = FakeProc(self)
++        self.solo()
++
++    def solo(self):
++        self.batch = 0
++
++    def parallel(self, n):
++        """The admission state start() makes for --batch n."""
++        self.batch = n
++        self.slot_busy = [False] * n
++        self.slot_held = [[] for _ in range(n)]
++        self.slot_cv = threading.Condition()
++        self.waiting = 0
++        self.admitting = 0
++        self.par_counters = {"queued": 0, "queue_wait_s": 0.0}
++        self.wait_lens = []
++        self.arrivals = collections.deque(maxlen=64)
++        self.ctl_epoch = 0
++        self.ctl = threading.Lock()
++        self.wlock = threading.Lock()
++
++
++class Helpers(unittest.TestCase):
++    def test_session_header_order_is_viiworks(self):
++        # viiwork's sessionKey (internal/proxy) routes by X-Session-Affinity first
++        self.assertEqual(kv_session_id({"X-Session-Affinity": "a", "X-Session-Id": "b"}), "a")
++        self.assertEqual(kv_session_id({"X-Session-Id": "b"}), "b")
++        # viiwork takes the first non-empty header as it stands, so a blank affinity hides the id there too
++        self.assertIsNone(kv_session_id({"X-Session-Affinity": " ", "X-Session-Id": "b"}))
++        self.assertEqual(kv_session_id({"X-Session-Affinity": "", "X-Session-Id": "b"}), "b")
++        self.assertIsNone(kv_session_id({}))
++        self.assertIsNone(kv_session_id({"X-Session-Id": "has space"}))
++        self.assertIsNone(kv_session_id({"X-Session-Id": "ünï"}))
++        # at most 256 bytes, never cut short (two long ids that start alike would share one remembered prompt)
++        self.assertEqual(len(kv_session_id({"X-Session-Id": "x" * 256})), 256)
++        self.assertIsNone(kv_session_id({"X-Session-Id": "x" * 257}))
++
++    def test_ids_hash_matches_the_engine(self):
++        # the same vector is pinned in src/core/conversation_file_test.cpp (session_ids_fnv1a64)
++        self.assertEqual(fnv1a64_ids([0, 1, -1, 151643]), 0x2401b33d3e943579)
++        self.assertEqual(fnv1a64_ids([]), 0xcbf29ce484222325)
++
++
++class KvExport(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.dir = tempfile.TemporaryDirectory()
++        cls.engine = FakeEngine()
++        cls.svc = Service(cls.engine, ByteTokenizer(), ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        cls.svc.slot_save_path = cls.dir.name
++        cls.httpd = serve(cls.svc, port=0)
++        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.httpd.shutdown()
++        cls.httpd.server_close()
++        cls.dir.cleanup()
++
++    def setUp(self):
++        self.engine.solo()
++        self.engine.refuse = None
++        self.engine.refuse_kind = "invalid"
++        self.engine.during = None
++        self.engine.proc = FakeProc(self.engine)
++        self.svc.__dict__.pop("kv_sessions", None)
++        self.svc.__dict__.pop("kv_sessions_bytes", None)
++
++    def post(self, path, body):
++        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
++                                     headers={"Content-Type": "application/json"})
++        try:
++            with urllib.request.urlopen(req, timeout=30) as r:
++                return r.status, json.loads(r.read())
++        except urllib.error.HTTPError as e:
++            with e:
++                return e.code, json.loads(e.read())
++
++    def save(self, session="s1", filename="s1.bin"):
++        return self.post("/slots/session?action=save", {"session": session, "filename": filename})
++
++    def test_sessions_kept_are_the_most_recent(self):
++        for i in range(KV_SESSIONS_KEPT + 5):
++            self.svc.kv_note(f"s{i}", [i])
++        self.svc.kv_note("s10", [10, 11])               # used again: moves to the newest end
++        self.svc.kv_note(None, [1])                     # no session: nothing kept
++        kept = self.svc.kv_sessions
++        self.assertEqual(len(kept), KV_SESSIONS_KEPT)
++        self.assertNotIn("s0", kept)
++        self.assertEqual(list(kept["s10"]), [10, 11])
++        self.assertEqual(next(reversed(kept)), "s10")
++        self.assertEqual(self.svc.kv_sessions_bytes, sum(4 * len(v) for v in kept.values()))
++
++    def test_sessions_kept_fit_their_byte_budget(self):
++        old = kv_export.KV_SESSIONS_BYTES
++        kv_export.KV_SESSIONS_BYTES = 4 * 1000             # 1000 tokens
++        try:
++            for i in range(5):
++                self.svc.kv_note(f"s{i}", range(300))   # 1200 bytes each: three fit
++            self.assertEqual(list(self.svc.kv_sessions), ["s2", "s3", "s4"])
++            self.svc.kv_note("s3", range(100))          # the same session again, shorter: counted once
++            self.assertEqual(self.svc.kv_sessions_bytes, 4 * 700)
++            self.svc.kv_note("big", range(5000))        # alone over the budget: kept, everything else goes
++            self.assertEqual(list(self.svc.kv_sessions), ["big"])
++            self.assertEqual(self.svc.kv_sessions_bytes, 4 * 5000)
++        finally:
++            kv_export.KV_SESSIONS_BYTES = old
++
++    def test_solo_save_names_the_conversation_by_its_prompt(self):
++        self.svc.kv_note("s1", [5, 6, 7])
++        code, body = self.save()
++        self.assertEqual(code, 200, body)
++        self.assertEqual(body["id_slot"], -1)
++        self.assertEqual(body["n_saved"], 3)
++        path = str(Path(self.dir.name) / "s1.bin")
++        self.assertEqual(self.engine.proc.sent, [f"SAVEX -1 3 {fnv1a64_ids([5, 6, 7]):016x} {0:016x} {path}"])
++        self.assertEqual((body["save_id"], body["base"], body["delta"]), ("00000000000000bb", None, False))
++
++    def test_save_against_a_base(self):
++        self.svc.kv_note("s1", [5, 6, 7])
++        code, body = self.post("/slots/session?action=save", {"session": "s1", "filename": "d.bin",
++                                                              "base": "00000000000000aa"})
++        self.assertEqual(code, 200, body)
++        self.assertEqual((body["save_id"], body["base"], body["delta"]), ("00000000000000bb", "00000000000000aa", True))
++        self.assertIn(" 00000000000000aa ", self.engine.proc.sent[0])
++        code, body = self.post("/slots/session?action=save", {"session": "s1", "filename": "d.bin",
++                                                              "base": "00000000000000cc"})
++        self.assertEqual((code, body["base"], body["delta"]), (200, None, False))   # unknown base: a full save
++        for bad in ("AA", "00000000000000AA", 5, "0x00000000000000"):
++            code, _ = self.post("/slots/session?action=save", {"session": "s1", "filename": "d.bin", "base": bad})
++            self.assertEqual(code, 400, bad)
++
++    def test_an_answer_out_of_step_ends_the_engine(self):
++        self.svc.kv_note("s1", [1])
++        orig = FakeProc.write
++        def bad(proc, s):
++            proc.sent.append(s.strip())
++            proc.engine.lines.put("SAVEDX 1 100 12.5 nothex!!nothex!! 0000000000000000\n")
++        FakeProc.write = bad
++        try:
++            code, _ = self.save()
++        finally:
++            FakeProc.write = orig
++        self.assertEqual(code, 500)
++        self.assertTrue(self.engine.ended)
++        self.engine.ended = False
++
++    def test_unknown_session_is_404_and_reaches_no_engine(self):
++        code, _ = self.save("nobody")
++        self.assertEqual(code, 404)
++        code, _ = self.post("/slots/session?action=save", {"session": 7, "filename": "x.bin"})
++        self.assertEqual(code, 404)
++        self.assertEqual(self.engine.proc.sent, [])
++
++    def test_a_conversation_no_longer_held_is_409(self):
++        self.svc.kv_note("s1", [1])
++        self.engine.refuse = "that conversation is no longer held there"
++        code, body = self.save()
++        self.assertEqual(code, 409, body)
++        self.engine.refuse = "the batch slot is decoding"
++        self.assertEqual(self.save()[0], 409)
++
++    def test_state_refusals_are_409_and_others_keep_their_status(self):
++        # a well-formed save is refused ("invalid") only for the state of that conversation
++        self.svc.kv_note("s1", [1])
++        for why in ("no complete session to save", "the batch slot's conversation has pictures"):
++            self.engine.refuse = why
++            code, body = self.save()
++            self.assertEqual(code, 409, why)
++            self.assertEqual(body["error"]["kind"], "invalid")
++        self.engine.refuse, self.engine.refuse_kind = "no space left on device", "storage"
++        code, body = self.save()
++        self.assertEqual(code, 507)
++        self.assertEqual(body["error"]["kind"], "storage")
++
++    def test_an_unload_waits_for_a_save_or_an_import(self):
++        # parallel requests do not hold the FIFO, but unload() takes it: a save or an import must hold it too, or an
++        # idle unload could end the engine in the middle of one
++        Path(self.dir.name, "in.bin").write_bytes(b"f")
++        for parallel in (0, 2):
++            if parallel:
++                self.engine.parallel(parallel)
++            seen = []
++            self.engine.during = lambda: seen.append(self.svc.unload())
++            self.svc.kv_note("s1", [1, 2, 3])
++            self.assertEqual(self.save()[0], 200)
++            self.assertEqual(self.post("/slots/0?action=import", {"filename": "in.bin"})[0], 200)
++            self.assertEqual(seen, ["busy", "busy"], parallel)
++            with self.svc.status_lock:
++                self.assertEqual(self.svc.status["queued"], 0)
++                self.assertFalse(self.svc.status.get("busy"))
++            self.assertFalse(self.svc.fifo.locked())
++
++    def test_a_save_or_an_import_counts_as_activity_for_the_idle_unload(self):
++        Path(self.dir.name, "in.bin").write_bytes(b"f")
++        self.engine.parallel(2)
++        self.svc.kv_note("s1", [1])
++        for call in (lambda: self.save(), lambda: self.post("/slots/0?action=import", {"filename": "in.bin"})):
++            self.svc.last_request_at = 0.0
++            self.assertEqual(call()[0], 200)
++            self.assertGreater(self.svc.last_request_at, 0.0)
++
++    def test_session_save_reclaim_retries_a_save_by_session(self):
++        # --session-save-reclaim: an unpublished RAM refusal is tried again, with the same SAVEX line
++        from unittest import mock
++        self.svc.kv_note("s1", [1, 2])
++        tries = []
++
++        def during():
++            tries.append(1)
++            if len(tries) == 1:
++                self.engine.refuse, self.engine.refuse_kind = ("not enough RAM to save the session (10 MiB plus a "
++                                                               "floor of 10 MiB needed, 5 available)"), "memory"
++            else:
++                self.engine.refuse = None
++        self.engine.during = during
++        self.engine.session_save_reclaim = True
++        try:
++            with mock.patch("serve.session_save_retry.available_mib", return_value=1 << 20), \
++                    mock.patch("serve.session_save_retry.POLL_SECONDS", 0.01):
++                code, body = self.save()
++        finally:
++            del self.engine.session_save_reclaim
++        self.assertEqual(code, 200, body)
++        self.assertEqual(len(tries), 2)
++        self.assertEqual(len(set(self.engine.proc.sent)), 1)
++        self.assertTrue(self.engine.proc.sent[0].startswith("SAVEX -1 2 "))
++
++    def test_session_endpoint_only_saves_and_checks_the_name(self):
++        self.svc.kv_note("s1", [1])
++        self.assertEqual(self.post("/slots/session?action=restore", {"session": "s1", "filename": "a.bin"})[0], 400)
++        for bad in ("../x.bin", "a/b.bin", "", None):
++            self.assertEqual(self.save(filename=bad)[0], 400, bad)
++        self.assertEqual(self.engine.proc.sent, [])
++
++    def held(self, session="s1"):
++        return self.post("/slots/session?action=held", {"session": session})
++
++    def test_held_asks_the_engine_by_the_sessions_last_prompt(self):
++        self.svc.kv_note("s1", [5, 6, 7])
++        h = f"{fnv1a64_ids([5, 6, 7]):016x}"
++        self.engine.held[(3, h)] = 50000
++        code, body = self.held()
++        self.assertEqual(code, 200, body)
++        self.assertEqual(body, {"session": "s1", "n_held": 50000})
++        self.assertEqual(self.engine.proc.sent, [f"HELD 3 {h}"])
++        self.engine.held.clear()                        # evicted
++        self.assertEqual(self.held()[1]["n_held"], 0)
++        self.assertFalse(self.svc.status["busy"], "a check is not work")
++
++    def test_held_by_a_replicas_own_ids(self):
++        self.svc.kv_note("s1", [9, 9])                  # another branch of the session: not what is asked
++        h = f"{fnv1a64_ids([5, 6, 7, 8]):016x}"
++        self.engine.held[(4, h)] = 4000
++        code, body = self.post("/slots/session?action=held", {"session": "s1", "n": 4, "hash": h})
++        self.assertEqual((code, body), (200, {"session": "s1", "n_held": 4000}))
++        self.assertEqual(self.engine.proc.sent, [f"HELD 4 {h}"])
++        # also for a session this server never saw: the ids name the conversation
++        self.assertEqual(self.post("/slots/session?action=held", {"session": "x", "n": 4, "hash": h})[1]["n_held"], 4000)
++        for bad in ({"n": 0, "hash": h}, {"n": "4", "hash": h}, {"n": 4, "hash": "XYZ"}, {"n": 4}, {"hash": h}):
++            self.assertEqual(self.post("/slots/session?action=held", {"session": "s1", **bad})[0], 400, bad)
++
++    def test_held_of_a_session_never_seen_is_0_and_reaches_no_engine(self):
++        self.assertEqual(self.held("nobody"), (200, {"session": "nobody", "n_held": 0}))
++        self.assertEqual(self.held(7)[1]["n_held"], 0)
++        self.assertEqual(self.engine.proc.sent, [])
++
++    def test_held_with_parallel_requests_takes_and_gives_back_the_lines(self):
++        e = self.engine
++        e.parallel(2)
++        self.svc.kv_note("s1", [1, 2])
++        e.held[(2, f"{fnv1a64_ids([1, 2]):016x}")] = 9
++        self.assertEqual(self.held(), (200, {"session": "s1", "n_held": 9}))
++        self.assertFalse(e.ctl.locked(), "the control lines are given back")
++
++    def test_held_answer_out_of_step_ends_the_engine(self):
++        self.svc.kv_note("s1", [1])
++        self.engine.proc.write = lambda s: self.engine.lines.put("HELD x\n")
++        code, _ = self.held()
++        self.assertEqual(code, 500)
++        self.assertTrue(self.engine.ended)
++        self.engine.ended = False
++
++    def test_parallel_save_takes_the_idle_slot_holding_the_conversation(self):
++        e = self.engine
++        e.parallel(3)
++        ids = [1, 2, 3]
++        e.slot_held[0] = [9, 9, 9, 9]                   # another conversation
++        e.slot_held[1] = ids + [4, 5]                   # this one, with its reply
++        e.slot_held[2] = ids + [4, 5, 6, 7]             # this one, longer - but decoding
++        e.slot_busy[2] = True
++        self.svc.kv_note("s1", ids)
++        code, body = self.save()
++        self.assertEqual(code, 200, body)
++        self.assertEqual(body["id_slot"], 1)
++        self.assertTrue(e.proc.sent[0].startswith(f"SAVEX 1 3 {fnv1a64_ids(ids):016x} {0:016x} "))
++        self.assertFalse(e.ctl.locked(), "the control lines are given back")
++        self.assertEqual(e.ctl_epoch, 1)
++
++    def test_parallel_save_falls_back_to_the_live_session(self):
++        e = self.engine
++        e.parallel(2)
++        e.slot_held[0] = [7, 7]
++        self.svc.kv_note("s1", [1, 2])
++        code, body = self.save()
++        self.assertEqual(code, 200, body)
++        self.assertEqual(body["id_slot"], -1)
++
++    def test_parallel_save_releases_the_lines_on_a_refusal(self):
++        e = self.engine
++        e.parallel(2)
++        self.svc.kv_note("s1", [1])
++        e.refuse = "that conversation is no longer held there"
++        self.assertEqual(self.save()[0], 409)
++        self.assertFalse(e.ctl.locked())
++
++    def test_import_parks_solo_and_with_parallel_requests(self):
++        Path(self.dir.name, "in.bin").write_bytes(b"f")
++        path = str(Path(self.dir.name) / "in.bin")
++        for parallel in (0, 2):
++            self.engine.proc = FakeProc(self.engine)
++            if parallel:
++                self.engine.parallel(parallel)
++            code, body = self.post("/slots/0?action=import", {"filename": "in.bin"})
++            self.assertEqual(code, 200, (parallel, body))
++            self.assertEqual(body["n_imported"], 50000)
++            self.assertEqual(self.engine.proc.sent, [f"IMPORT {path}"])
++        self.assertFalse(self.engine.ctl.locked())
++
++    def test_import_of_a_missing_file_is_404_and_reaches_no_engine(self):
++        for parallel in (0, 2):
++            if parallel:
++                self.engine.parallel(parallel)
++            code, _ = self.post("/slots/0?action=import", {"filename": "nothing.bin"})
++            self.assertEqual(code, 404)
++        self.assertEqual(self.engine.proc.sent, [])
++
++    def test_import_refused_by_the_engine_keeps_its_kind(self):
++        Path(self.dir.name, "in.bin").write_bytes(b"f")
++        self.engine.parallel(2)
++        self.engine.refuse = "session file: saved with another model (model fingerprint differs)"
++        code, body = self.post("/slots/0?action=import", {"filename": "in.bin"})
++        self.assertEqual(code, 400)
++        self.assertEqual(body["error"]["kind"], "invalid")
++        self.assertFalse(self.engine.ctl.locked())
++
++    def test_save_and_restore_stay_refused_with_parallel_requests(self):
++        self.engine.parallel(2)
++        Path(self.dir.name, "in.bin").write_bytes(b"f")
++        for action in ("save", "restore"):
++            code, _ = self.post(f"/slots/0?action={action}", {"filename": "in.bin"})
++            self.assertEqual(code, 501, action)
++        self.assertEqual(self.engine.proc.sent, [])
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/src/core/conversation_file.cpp b/src/core/conversation_file.cpp
+index 24291be554d72ad8d9595fa15cd796d5bbbe2044..1586527888ffe2372a5892eea2aef1df325c1354 100644
+--- a/src/core/conversation_file.cpp
++++ b/src/core/conversation_file.cpp
+@@ -1,9 +1,11 @@
+ #include "strata/core/conversation_file.hpp"
++#include "session_delta_file.hpp"   // kv-export: the delta file writer's own pieces
+ 
+ #include <algorithm>
+ #include <bit>
+ #include <cerrno>
+ #include <chrono>
++#include <thread>
+ #include <climits>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -47,6 +49,7 @@ constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
+ constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
+ constexpr uint32_t kVersion = 1;
+ constexpr size_t kHeader = 64, kTrailer = 16;
++using namespace session_delta_detail;   // kv-export: the delta file (STRSDLT v1) constants and helpers, session_delta_file.hpp
+ 
+ // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
+ // - the last, partial block included - so a small file reports too, and each report follows real movement.
+@@ -527,7 +530,10 @@ bool free_space(const std::string& path, uint64_t& out) {
+ 
+ class FileSink {
+ public:
+-    explicit FileSink(RawFile& f) : buf_(aligned_block()), f_(f) {}
++    explicit FileSink(RawFile& f, bool write_behind = false) : buf_(aligned_block()), f_(f) {
++        if (write_behind) spare_ = aligned_block();   // none: blocks are written in place, as before
++    }
++    ~FileSink() { if (pending_.joinable()) pending_.join(); }   // a failed write never reached finish()
+     bool ok() const { return buf_ != nullptr; }
+     std::string error() const {
+         if (!buf_) return "out of memory for the write buffer";
+@@ -551,6 +557,7 @@ public:
+     }
+     // last block padded to the alignment for direct I/O, then the file cut back to its exact size and flushed
+     bool finish(bool durable) {
++        if (!settle()) { f_.close(); return false; }
+         if (!f_.is_open()) return false;
+         if (fault_) { f_.close(); return false; }
+         const size_t padded = f_.direct() ? (used_ + kAlign - 1) / kAlign * kAlign : used_;
+@@ -572,12 +579,42 @@ private:
+     void fail_with(int e) { fault_ = true; fault_kind_ = errno_kind(e); fault_msg_ = std::strerror(e); }
+     bool drain() {
+         if (write_fault) { fail_with(write_fault); return false; }
++        if (spare_) {
++            // write-behind: the full block goes to the writer thread; the previous one must have landed first (one
++            // write in flight, in file order)
++            if (!settle()) return false;
++            std::swap(buf_, spare_);
++            pending_n_ = used_;
++            pending_total_ = total_;
++            try {
++                pending_ = std::thread([this] { pending_ok_ = f_.write_all(spare_.get(), pending_n_); });
++            } catch (const std::system_error&) {       // no thread to be had: this block is written here instead
++                used_ = 0;
++                if (!f_.write_all(spare_.get(), pending_n_)) return false;
++                if (progress) (*progress)(pending_total_, expected);
++                return true;
++            }
++            used_ = 0;
++            return true;
++        }
+         if (!f_.write_all(buf_.get(), used_)) return false;
+         used_ = 0;
+         if (progress) (*progress)(total_, expected);
+         return true;
+     }
+-    Aligned buf_;
++    // the block in flight has landed (or there is none); its progress is reported here, on the caller's thread
++    bool settle() {
++        if (!pending_.joinable()) return true;
++        pending_.join();
++        if (!pending_ok_) return false;
++        if (progress) (*progress)(pending_total_, expected);
++        return true;
++    }
++    Aligned buf_, spare_;
++    std::thread pending_;
++    bool pending_ok_ = true;
++    size_t pending_n_ = 0;
++    uint64_t pending_total_ = 0;
+     RawFile& f_;
+     bool fault_ = false;
+     SessionError fault_kind_ = SessionError::io;
+@@ -588,7 +625,12 @@ private:
+ 
+ class FileSource {
+ public:
+-    explicit FileSource(RawFile& f) : buf_(aligned_block()), f_(f) {}
++    // kv-export: read_ahead - a reader thread fills the next 16 MiB block while the caller parses (copies and hashes)
++    // the current one; off when the second block cannot be allocated
++    explicit FileSource(RawFile& f, bool read_ahead = true) : buf_(aligned_block()), f_(f) {
++        if (read_ahead) spare_ = aligned_block();
++    }
++    ~FileSource() { if (ahead_.joinable()) ahead_.join(); }   // a refused parse stops before the end
+     bool ok() const { return buf_ != nullptr; }
+     std::string error() const { return buf_ ? f_.error() : std::string("out of memory for the read buffer"); }
+     SessionError kind() const { return buf_ ? f_.kind() : SessionError::memory; }
+@@ -605,22 +647,50 @@ public:
+     std::optional<Ticker> progress;
+     uint64_t expected = 0;
+ private:
++    // one block into dst: its bytes (0 at the end of the file), -1 on an error
++    long long read_block(uint8_t* dst) {
++        size_t have = 0;
++        while (have < kBlock) {
++            const long long r = f_.read_some(dst + have, kBlock - have);
++            if (r < 0) return -1;
++            if (r == 0) break;
++            have += (size_t) r;
++            if (f_.direct() && have % kAlign) break;   // short aligned read: end of file
++        }
++        return (long long) have;
++    }
++    void read_ahead() {
++        try {
++            ahead_ = std::thread([this] { ahead_n_ = read_block(spare_.get()); });
++        } catch (const std::system_error&) {           // no thread to be had: fill() reads the next block itself
++        }
++    }
+     bool fill() {
+         at_ = have_ = 0;
+-        while (have_ < kBlock) {
+-            const long long r = f_.read_some(buf_.get() + have_, kBlock - have_);
+-            if (r < 0) return false;
+-            if (r == 0) break;
+-            have_ += (size_t) r;
+-            if (f_.direct() && have_ % kAlign) break;   // short aligned read: end of file
++        long long n;
++        if (!spare_) {
++            n = read_block(buf_.get());
++        } else {
++            if (!ahead_.joinable()) {                  // the first block: read here, the next one ahead
++                n = read_block(buf_.get());
++            } else {
++                ahead_.join();
++                std::swap(buf_, spare_);
++                n = ahead_n_;
++            }
++            if (n == (long long) kBlock) read_ahead(); // a whole block: there may be more
+         }
++        if (n < 0) return false;
++        have_ = (size_t) n;
+         const uint64_t before = total_;
+         total_ += have_;
+         if (progress && total_ > before) (*progress)(total_, expected);
+         return have_ > 0;
+     }
+-    Aligned buf_;
++    Aligned buf_, spare_;
+     RawFile& f_;
++    std::thread ahead_;
++    long long ahead_n_ = 0;
+     size_t at_ = 0, have_ = 0;
+     uint64_t total_ = 0;
+ };
+@@ -639,8 +709,14 @@ struct Out {
+         count(c);
+         if (!f || !ok || !c) return;
+         if (hash) hash->update(p, c);
++        const auto t = std::chrono::steady_clock::now();
+         ok = f->write(p, c);
++        disk_ms += since(t);
+     }
++    static double since(std::chrono::steady_clock::time_point t) {
++        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
++    }
++    double source_ms = 0, disk_ms = 0;   // kv-export: where a streamed write's time goes
+     void u64(uint64_t v) { raw(&v, 8); }
+     void i64(int64_t v) { raw(&v, 8); }
+     template<class T> void vec(const std::vector<T>& v) { u64(v.size()); raw(v.data(), v.size() * sizeof(T)); }
+@@ -648,26 +724,53 @@ struct Out {
+         u64(b.size());
+         b.visit(0, b.size(), [&](const uint8_t* p, size_t c, size_t) { raw(p, c); return ok; });
+     }
+-    // a K/V part pulled from its owner straight into the file block (sizing pass: counted, never read)
++    // kv-export: chunk hashes out, and the delta being written (layer: the K/V layer being written)
++    SessionKvChunks* chunks = nullptr;
++    const SessionDelta* delta = nullptr;
++    size_t layer = 0;
++    // a K/V part pulled from its owner straight into the file block (sizing pass: counted, never read).  A delta
++    // writes (size, keep, the bytes from keep on, the chunk hashes); chunk hashes are computed as the bytes pass.
+     void source(const SessionKvSource& s, size_t part) {
+         const size_t size = s.sizes[part];
++        const size_t keep = delta ? (size_t) delta->keep[layer][part] : 0;
++        const size_t n_chunks = (size_t) ((size + kSessionChunk - 1) / kSessionChunk);
+         u64(size);
+-        if (!f) { count(size); return; }
+-        for (size_t at = 0; at < size && ok;) {
++        if (delta) u64(keep);
++        KvChunkHasher hashes;   // session_delta_file.hpp
++        const bool hashing = f && (chunks || delta);
++        if (hashing) hashes.start(n_chunks, delta, layer, part, keep);
++        if (!f) count(size - keep);
++        for (size_t at = keep; f && at < size && ok;) {
+             size_t room = 0;
+             uint8_t* d = f->span(room);
+             const size_t c = std::min(room, size - at);
+-            if (!s.read || !s.read(part, at, d, c)) {
++            const auto t = std::chrono::steady_clock::now();
++            const bool got = s.read && s.read(part, at, d, c);
++            source_ms += since(t);
++            if (!got) {
+                 ok = false;
+                 read_failed = true;
+                 if (s.error) read_error = s.error();
+                 return;
+             }
+             if (hash) hash->update(d, c);
++            if (hashing) hashes.update(d, c);
+             count(c);
++            const auto t2 = std::chrono::steady_clock::now();
+             ok = ok && f->commit(c);
++            disk_ms += since(t2);
+             at += c;
+         }
++        if (hashing && ok) hashes.finish();
++        if (delta) {
++            u64(n_chunks);
++            if (!f) count(n_chunks * 8);
++            else if (ok) {
++                if (hashes.list.size() != n_chunks) { ok = false; read_failed = true; read_error = "chunk hash count"; return; }
++                raw(hashes.list.data(), hashes.list.size() * 8);
++            }
++        }
++        if (hashing && ok && chunks) (*chunks)[layer][part] = std::move(hashes.list);
+     }
+     bool read_failed = false;
+     std::string read_error;
+@@ -686,15 +789,28 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
+     o.u64(c.used);
+ }
+ 
+-void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
++void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr,
++                 bool deepest_only = false, const std::vector<const ConversationCheckpoint*>* checks = nullptr) {
+     for (int64_t g : s.geometry) o.i64(g);
+     o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
+     put_checkpoint(o, s.live);
+-    o.u64(s.checkpoints.size());
+-    for (const auto& c : s.checkpoints) put_checkpoint(o, c);
++    if (checks) {
++        o.u64(checks->size());
++        for (const ConversationCheckpoint* c : *checks) put_checkpoint(o, *c);
++    } else if (deepest_only) {   // kv-export: a parked image keeps its chain; the file keeps what a save keeps
++        const ConversationCheckpoint* d = session_deepest_checkpoint(s.checkpoints);
++        o.u64(d ? 1 : 0);
++        if (d) put_checkpoint(o, *d);
++    } else {
++        o.u64(s.checkpoints.size());
++        for (const auto& c : s.checkpoints) put_checkpoint(o, c);
++    }
+     if (sources) {
+         o.u64(sources->size());
+-        for (const auto& k : *sources) {
++        if (o.chunks) o.chunks->assign(sources->size(), {});
++        for (size_t j = 0; j < sources->size(); ++j) {
++            const auto& k = (*sources)[j];
++            o.layer = j;
+             put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
+             for (size_t part = 0; part < 5; ++part) o.source(k, part);
+         }
+@@ -1026,19 +1142,44 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes) {
+ namespace {
+ bool write_impl(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
+                 const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
+-                SessionStatus& st) {
++                SessionStatus& st, bool deepest_only) {
+     st = {};
+     st.error = SessionError::invalid;   // refusals before any disk access
+     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
+     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
++    const std::vector<const ConversationCheckpoint*>* checks = opt.checkpoints ? &*opt.checkpoints : nullptr;
++    if (checks && (deepest_only || !image.checkpoints.empty())) {
++        error = "session file: checkpoints given both in the image and in the options";
++        return false;
++    }
++    if (checks) for (const auto* c : *checks) if (!c) { error = "session file: a null checkpoint"; return false; }
++    // kv-export: chunk hashes or a delta need the K/V as sources; an image's own K/V becomes sources here
++    std::vector<SessionKvSource> own;
++    if (!sources && (opt.kv_chunks || opt.delta)) {
++        own = image_sources(image);
++        sources = &own;
++    }
++    if (opt.delta && !delta_valid(*opt.delta, *sources, error)) return false;
+     Out sizing;
+-    put_payload(sizing, image, sources);
++    sizing.delta = opt.delta;
++    put_payload(sizing, image, sources, deepest_only, checks);
+     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
+         sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
+         error = "session file: the state is too large for this build";
+         return false;
+     }
+-    const uint64_t payload = sizing.n, total = kHeader + payload + kTrailer;
++    uint64_t full_size = 0;   // a delta: the session file it rebuilds
++    if (opt.delta) {
++        Out whole;
++        put_payload(whole, image, sources, deepest_only, checks);
++        if (whole.overflow || whole.n > UINT64_MAX - kHeader - kTrailer) {
++            error = "session file: the state is too large for this build";
++            return false;
++        }
++        full_size = kHeader + whole.n + kTrailer;
++    }
++    const size_t header = opt.delta ? kDeltaHeader : kHeader;
++    const uint64_t payload = sizing.n, total = header + payload + kTrailer;
+     st.error = SessionError::io;
+     if (opt.min_free_bytes) {
+         uint64_t avail = 0;
+@@ -1059,7 +1200,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
+         error = "session file: cannot create a temporary file beside " + path + ": " + error;
+         return false;
+     }
+-    FileSink f(raw);
++    FileSink f(raw, opt.write_behind);
+     if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
+     if (opt.progress) f.progress.emplace(opt.progress);
+     f.phase = opt.phase;
+@@ -1068,20 +1209,26 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
+     const std::function<int(const char*)>* fault = opt.fault ? &opt.fault : nullptr;
+     f.write_fault = injected(fault, "write");
+     f.flush_fault = injected(fault, "file_flush");
+-    uint8_t h[kHeader];
+-    header_bytes(h, id, payload);
+-    bool ok = f.write(h, kHeader);
++    uint8_t h[kDeltaHeader];
++    if (opt.delta) delta_header_bytes(h, id, payload, *opt.delta, full_size);
++    else header_bytes(h, id, payload);
++    bool ok = f.write(h, header);
+     SessionHasher hash(0);
+     Out out;
+     out.f = &f;
+     out.hash = &hash;
+-    if (ok) put_payload(out, image, sources);
++    out.chunks = opt.kv_chunks;
++    out.delta = opt.delta;
++    if (ok) put_payload(out, image, sources, deepest_only, checks);
+     ok = ok && out.ok && out.n == payload;
+     if (ok) {
+         const uint64_t ph = hash.digest();
+-        ok = f.write(&ph, 8) && f.write(kEnd, 8);
++        ok = f.write(&ph, 8) && f.write(opt.delta ? kDeltaEnd : kEnd, 8);
+     }
++    const auto tf = std::chrono::steady_clock::now();
+     ok = f.finish(opt.durable) && ok;
++    st.source_ms = out.source_ms;
++    st.disk_ms = out.disk_ms + Out::since(tf);
+     std::string why;
+     if (!ok) {
+         why = out.read_failed ? "K/V source read" + (out.read_error.empty() ? std::string() : ": " + out.read_error)
+@@ -1102,11 +1249,11 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
+ 
+ bool write_guarded(const std::string& path, const SavedConversation& image, const std::vector<SessionKvSource>* sources,
+                    const SessionFileIdentity& id, size_t& bytes, std::string& error, const SessionWriteOptions& opt,
+-                   SessionStatus* status) {
++                   SessionStatus* status, bool deepest_only = false) {
+     SessionStatus st;
+     bool ok = false;
+     try {
+-        ok = write_impl(path, image, sources, id, bytes, error, opt, st);
++        ok = write_impl(path, image, sources, id, bytes, error, opt, st, deepest_only);
+     } catch (const std::bad_alloc&) {
+         error = "session file: out of memory while writing " + path;
+         st.error = SessionError::memory;
+@@ -1170,6 +1317,12 @@ bool session_file_write(const std::string& path, const SavedConversation& image,
+     return write_guarded(path, image, nullptr, id, bytes, error, options, status);
+ }
+ 
++bool session_file_write_parked(const std::string& path, const SavedConversation& image, const SessionFileIdentity& id,
++                               size_t& bytes, std::string& error, const SessionWriteOptions& options,
++                               SessionStatus* status) {
++    return write_guarded(path, image, nullptr, id, bytes, error, options, status, true);
++}
++
+ namespace {
+ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
+                size_t& bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
+diff --git a/src/core/conversation_file_test.cpp b/src/core/conversation_file_test.cpp
+index fd85f2cab1c3a56716a2f6ea6893995df78eedd4..d578074d2ea169af54d7df458d91a0aa587ac2b4 100644
+--- a/src/core/conversation_file_test.cpp
++++ b/src/core/conversation_file_test.cpp
+@@ -3,6 +3,7 @@
+ #include "strata/core/conversation_file.hpp"
+ #include "strata/core/session_save_reclaim.hpp"
+ 
++#include <algorithm>
+ #include <array>
+ #include <cerrno>
+ #include <chrono>
+@@ -97,6 +98,106 @@ SavedConversation sample() {
+ constexpr size_t kGoldenSize = 17878535;
+ constexpr uint64_t kGoldenHash = 0x70f812b350360d09ull;
+ 
++
++// kv-export: the reference rebuild of a session file from its base and a delta (STRSDLT v1) - the receiver's job,
++// written out here as the format's executable description.
++uint64_t rd64(const std::vector<char>& f, size_t at) { uint64_t v; std::memcpy(&v, f.data() + at, 8); return v; }
++struct PartAt { size_t off = 0, size = 0; };
++// a STRSESS file: where each K/V part's bytes are
++bool strsess_parts(const std::vector<char>& f, std::vector<std::array<PartAt, 5>>& parts) {
++    size_t at = 64 + 18 * 8 + 3 * 8;
++    auto need = [&](size_t n) { return at <= f.size() && n <= f.size() - at; };
++    auto checkpoint = [&] {
++        if (!need(8)) return false;
++        at += 8 + rd64(f, at) * 4;                    // ids
++        if (!need(8)) return false;
++        at += 8 + rd64(f, at) * 16;                   // images
++        for (int i = 0; i < 5; ++i) { if (!need(8)) return false; at += 8 + rd64(f, at); }   // gdn ple tails dead block_pos
++        at += 8;                                      // used
++        return need(0);
++    };
++    if (!checkpoint() || !need(8)) return false;
++    const uint64_t checks = rd64(f, at); at += 8;
++    for (uint64_t i = 0; i < checks; ++i) if (!checkpoint()) return false;
++    if (!need(8)) return false;
++    const uint64_t layers = rd64(f, at); at += 8;
++    parts.assign(layers, {});
++    for (uint64_t j = 0; j < layers; ++j) {
++        at += 7 * 8;
++        for (auto& p : parts[j]) {
++            if (!need(8)) return false;
++            p.size = rd64(f, at); at += 8;
++            if (!need(p.size)) return false;
++            p.off = at; at += p.size;
++        }
++    }
++    return at + 16 == f.size();
++}
++bool rebuild(const std::vector<char>& base, const std::vector<char>& d, std::vector<char>& out, std::string& why) {
++    auto fail = [&](const char* w) { why = w; return false; };
++    if (d.size() < 96 || std::memcmp(d.data(), "STRSDLT\x01", 8) != 0) return fail("delta magic");
++    uint32_t version, hsize;
++    std::memcpy(&version, d.data() + 8, 4); std::memcpy(&hsize, d.data() + 12, 4);
++    if (version != 1 || hsize != 80 || rd64(d, 72) != session_hash64(d.data(), 72, 0)) return fail("delta header");
++    const uint64_t payload = rd64(d, 32), full = rd64(d, 56);
++    if (80 + payload + 16 != d.size() || std::memcmp(d.data() + d.size() - 8, "STRSDEND", 8) != 0) return fail("delta size");
++    if (rd64(d, d.size() - 16) != session_hash64(d.data() + 80, payload, 0)) return fail("delta payload hash");
++    if (rd64(d, 16) != rd64(base, 16) || rd64(d, 24) != rd64(base, 24)) return fail("identity");
++    std::vector<std::array<PartAt, 5>> bp;
++    if (!strsess_parts(base, bp)) return fail("base layout");
++    std::vector<char> body;                           // the rebuilt payload
++    size_t at = 80;
++    auto copy = [&](size_t n) { body.insert(body.end(), d.begin() + (ptrdiff_t) at, d.begin() + (ptrdiff_t) (at + n)); at += n; };
++    auto checkpoint = [&] {
++        copy(8 + rd64(d, at) * 4);
++        copy(8 + rd64(d, at) * 16);
++        for (int i = 0; i < 5; ++i) copy(8 + rd64(d, at));
++        copy(8);
++    };
++    copy(18 * 8 + 3 * 8);
++    checkpoint();
++    const uint64_t checks = rd64(d, at); copy(8);
++    for (uint64_t i = 0; i < checks; ++i) checkpoint();
++    const uint64_t layers = rd64(d, at); copy(8);
++    if (layers != bp.size()) return fail("layer count");
++    for (uint64_t j = 0; j < layers; ++j) {
++        copy(7 * 8);
++        for (size_t p = 0; p < 5; ++p) {
++            const uint64_t size = rd64(d, at), keep = rd64(d, at + 8);
++            at += 16;
++            if (keep > size || keep % kSessionChunk || keep > bp[j][p].size) return fail("keep");
++            const size_t start = body.size();
++            body.insert(body.end(), (const char*) &size, (const char*) &size + 8);
++            body.insert(body.end(), base.begin() + (ptrdiff_t) bp[j][p].off, base.begin() + (ptrdiff_t) (bp[j][p].off + keep));
++            body.insert(body.end(), d.begin() + (ptrdiff_t) at, d.begin() + (ptrdiff_t) (at + size - keep));
++            at += size - keep;
++            const uint64_t n = rd64(d, at); at += 8;
++            if (n != (size + kSessionChunk - 1) / kSessionChunk) return fail("chunk count");
++            for (uint64_t i = 0; i < n; ++i) {        // every chunk of the rebuilt part against the engine's hash
++                const size_t c0 = start + 8 + i * kSessionChunk, c = (size_t) std::min<uint64_t>(kSessionChunk, size - i * kSessionChunk);
++                if (session_hash64(body.data() + c0, c, 0) != rd64(d, at + i * 8)) return fail("chunk hash");
++            }
++            at += n * 8;
++        }
++    }
++    if (at != 80 + payload) return fail("delta payload walk");
++    out.assign(64, 0);
++    std::memcpy(out.data(), "STRSESS\x01", 8);
++    const uint32_t v1 = 1, h64 = 64;
++    std::memcpy(out.data() + 8, &v1, 4); std::memcpy(out.data() + 12, &h64, 4);
++    std::memcpy(out.data() + 16, d.data() + 16, 16);  // model, config
++    const uint64_t pl = body.size();
++    std::memcpy(out.data() + 32, &pl, 8);
++    const uint64_t hh = session_hash64(out.data(), 56, 0);
++    std::memcpy(out.data() + 56, &hh, 8);
++    out.insert(out.end(), body.begin(), body.end());
++    const uint64_t ph = session_hash64(body.data(), body.size(), 0);
++    out.insert(out.end(), (const char*) &ph, (const char*) &ph + 8);
++    out.insert(out.end(), "STRSEND\x01", "STRSEND\x01" + 8);
++    if (out.size() != full) return fail("full size");
++    return true;
++}
++
+ bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
+     return a.ids == b.ids && a.imgs == b.imgs && a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails &&
+            a.dead == b.dead && a.block_pos == b.block_pos && a.used == b.used && b.stage_parts.empty();
+@@ -151,6 +252,11 @@ bool rejects(const fs::path& p, const SessionFileIdentity& id, const char* expec
+ } // namespace
+ 
+ int main() {
++    {   // kv-export: the conversation name SAVEC checks; the same vector is pinned in serve/test_kv_export.py
++        const int32_t ids[] = {0, 1, -1, 151643};
++        check(session_ids_fnv1a64(ids, 4) == 0x2401b33d3e943579ULL, "SAVEC ids hash matches the server's");
++        check(session_ids_fnv1a64(ids, 0) == 14695981039346656037ULL, "SAVEC ids hash of nothing is the basis");
++    }
+     const fs::path dir = fs::temp_directory_path() / ("strata-session-test-" + std::to_string(
+         std::chrono::steady_clock::now().time_since_epoch().count()));
+     fs::create_directories(dir);
+@@ -190,6 +296,164 @@ int main() {
+         check(read == written, "read reports the file size");
+         check(same(original, back), "round trip is identical");
+     }
++    // kv-export: a parked image keeps its chain; its file keeps only the deepest checkpoint, byte for byte the file
++    // of the same image holding that checkpoint alone
++    {
++        const fs::path parked = dir / "parked.bin", alone = dir / "alone.bin";
++        size_t pw = 0, aw = 0;
++        check(session_file_write_parked(parked.string(), original, id, pw, error), "parked write succeeds");
++        SavedConversation one = sample();
++        one.checkpoints.erase(one.checkpoints.begin());   // sample(): checkpoints at 10 and 500 tokens
++        check(session_file_write(alone.string(), one, id, aw, error), "write of the deepest alone");
++        check(pw == aw && slurp(parked) == slurp(alone), "parked write keeps only the deepest checkpoint");
++        SavedConversation back;
++        size_t read = 0;
++        check(session_file_read(parked.string(), id, back, read, error) && same(one, back), "parked file reads back");
++        check(original.checkpoints.size() == 2, "parked write leaves the image untouched");
++    }
++    // kv-export: the writer thread (write_behind, on by default) writes the same bytes as writing each block in place
++    {
++        const fs::path behind = dir / "behind.bin", inplace = dir / "inplace.bin";
++        size_t bw = 0, iw = 0;
++        SessionWriteOptions sync_opt;
++        sync_opt.write_behind = false;
++        std::vector<uint64_t> reports;
++        SessionWriteOptions behind_opt;
++        behind_opt.progress = [&](uint64_t done, uint64_t) { reports.push_back(done); };
++        check(session_file_write(behind.string(), original, id, bw, error, behind_opt), "write-behind write");
++        check(session_file_write(inplace.string(), original, id, iw, error, sync_opt), "in-place write");
++        check(bw == iw && slurp(behind) == slurp(inplace), "write-behind writes the same bytes");
++        check(reports.size() >= 3 && reports.front() == 0 && reports.back() == bw &&
++                  std::is_sorted(reports.begin(), reports.end()), "write-behind progress rises to the file size");
++    }
++    // kv-export: checkpoints by reference write the same file as the image holding copies of them
++    {
++        const fs::path byref = dir / "byref.bin", copied = dir / "copied.bin";
++        size_t rw = 0, cw = 0;
++        SavedConversation bare = sample();
++        const std::vector<ConversationCheckpoint> chain = std::move(bare.checkpoints);
++        bare.checkpoints.clear();
++        SessionWriteOptions opt;
++        opt.checkpoints = std::vector<const ConversationCheckpoint*>{&chain[1]};
++        check(session_file_write(byref.string(), bare, id, rw, error, opt), "write with checkpoints by reference");
++        SavedConversation one = sample();
++        one.checkpoints.erase(one.checkpoints.begin());
++        check(session_file_write(copied.string(), one, id, cw, error), "write with the checkpoint copied");
++        check(rw == cw && slurp(byref) == slurp(copied), "checkpoints by reference write the same bytes");
++        check(!session_file_write((dir / "both.bin").string(), original, id, rw, error, opt) &&
++                  error.find("both") != std::string::npos, "checkpoints in the image and the options are refused");
++        error.clear();
++    }
++    // kv-export: delta saves (STRSDLT v1).  base = sample(); next = the same conversation a turn later: layer 0's k
++    // grew and changed after 5 MiB, layer 1's v changed after 1 KiB, the live state and checkpoints are new.
++    {
++        const fs::path basef = dir / "dbase.bin", deltaf = dir / "ddelta.bin", fullf = dir / "dfull.bin";
++        SessionKvChunks base_chunks, full_chunks, delta_chunks;
++        size_t w = 0;
++        SessionWriteOptions bo;
++        bo.kv_chunks = &base_chunks;
++        check(session_file_write(basef.string(), original, id, w, error, bo), "delta: base written with chunk hashes");
++        check(base_chunks.size() == 3 && base_chunks[0][0].size() == ((17u << 20) + 5 + kSessionChunk - 1) / kSessionChunk &&
++                  base_chunks[0][0][0] == [&] {
++                      SessionHasher h(0);
++                      original.kv[0].k.visit(0, kSessionChunk, [&](const uint8_t* p, size_t c, size_t) { h.update(p, c); return true; });
++                      return h.digest();
++                  }(),
++              "delta: chunk hashes of the base");
++        SavedConversation next = sample();
++        next.live = checkpoint(1100, 9);
++        next.checkpoints = {checkpoint(1000, 8)};
++        {
++            ConversationBuffer k = pattern((18u << 20) + 77, 0);
++            original.kv[0].k.visit(0, 5u << 20, [&](const uint8_t* p, size_t c, size_t at) {
++                k.visit(at, c, [&](uint8_t* q, size_t c2, size_t at2) { std::memcpy(q, p + (at2 - at), c2); return true; });
++                return true;
++            });
++            k.visit(5u << 20, 1, [](uint8_t* q, size_t, size_t) { *q ^= 0x5a; return true; });
++            next.kv[0].k = std::move(k);
++            next.kv[1].v.visit(1024, 1, [](uint8_t* q, size_t, size_t) { *q ^= 1; return true; });
++        }
++        SessionDelta d;
++        d.base = 0x1111111111111111ull;
++        d.id = 0x2222222222222222ull;
++        d.base_chunks = &base_chunks;
++        d.keep.assign(3, {});
++        d.keep[0][0] = 5u << 20;                       // 20 whole chunks, all before the first change
++        d.keep[0][1] = 4096 / kSessionChunk * kSessionChunk;   // 0: the part is smaller than a chunk
++        d.keep[2][0] = 0;
++        SessionWriteOptions dopt;
++        dopt.delta = &d;
++        dopt.kv_chunks = &delta_chunks;
++        size_t dw = 0, fw = 0;
++        check(session_file_write(deltaf.string(), next, id, dw, error, dopt), "delta: delta written");
++        SessionWriteOptions fo;
++        fo.kv_chunks = &full_chunks;
++        check(session_file_write(fullf.string(), next, id, fw, error, fo), "delta: the full file of the same state");
++        check(dw < fw && delta_chunks == full_chunks, "delta: smaller, and the same chunk hashes as the full file");
++        std::vector<char> rebuilt;
++        std::string why;
++        const std::vector<char> base_bytes = slurp(basef), delta_bytes = slurp(deltaf), full_bytes = slurp(fullf);
++        check(rebuild(base_bytes, delta_bytes, rebuilt, why) && rebuilt == full_bytes,
++              ("delta: base + delta rebuilds the full file byte for byte " + why).c_str());
++        {
++            SavedConversation back;
++            size_t r = 0;
++            const fs::path rf = dir / "drebuilt.bin";
++            std::ofstream(rf, std::ios::binary).write(rebuilt.data(), (std::streamsize) rebuilt.size());
++            check(session_file_read(rf.string(), id, back, r, error) && same(next, back), "delta: the rebuilt file reads");
++        }
++        {   // what the chunk hashes protect: the receiver's copy.  A base damaged at rest inside the kept bytes, or a
++            // delta damaged on the way, fails the rebuild
++            std::vector<char> damaged = base_bytes;
++            std::vector<std::array<PartAt, 5>> bp;
++            check(strsess_parts(damaged, bp), "delta: base layout");
++            damaged[bp[0][0].off + 12345] ^= 1;
++            check(!rebuild(damaged, delta_bytes, rebuilt, why) && why == "chunk hash", "delta: a damaged base is caught");
++            std::vector<char> bent = delta_bytes;
++            bent[bent.size() - 40] ^= 1;
++            check(!rebuild(base_bytes, bent, rebuilt, why) && why == "delta payload hash", "delta: a damaged delta is caught");
++        }
++        {   // what they cannot protect: the engine's own keep.  Kept bytes take the base's hashes, so a keep past the
++            // first change rebuilds a consistent file with the base's (stale) bytes there: keep must be right
++            SessionDelta bad = d;
++            bad.keep[0][0] = 6u << 20;                 // past the change at 5 MiB
++            const fs::path bf = dir / "dbad.bin";
++            check(session_file_write(bf.string(), next, id, w, error, SessionWriteOptions{.delta = &bad}),
++                  "delta: a keep past the change is written (the engine cannot see it)");
++            check(rebuild(base_bytes, slurp(bf), rebuilt, why) && rebuilt != full_bytes,
++                  "delta: ... and rebuilds a consistent file that is not the new state");
++        }
++        {
++            SessionDelta odd = d;
++            odd.keep[0][0] = kSessionChunk + 1;
++            check(!session_file_write((dir / "dodd.bin").string(), next, id, w, error, SessionWriteOptions{.delta = &odd}) &&
++                      error.find("whole chunks") != std::string::npos, "delta: a keep that is not whole chunks is refused");
++            odd.keep[0][0] = (base_chunks[0][0].size() + 1) * kSessionChunk;
++            check(!session_file_write((dir / "dodd.bin").string(), next, id, w, error, SessionWriteOptions{.delta = &odd}),
++                  "delta: a keep past the base's chunks is refused");
++            error.clear();
++        }
++        {   // a parked image (no sources) as a delta, with only its deepest checkpoint
++            SavedConversation parked = next;
++            parked.checkpoints.insert(parked.checkpoints.begin(), checkpoint(10, 2));
++            const fs::path pf = dir / "dparked.bin";
++            check(session_file_write_parked(pf.string(), parked, id, w, error, SessionWriteOptions{.delta = &d}),
++                  "delta: a parked image written as a delta");
++            check(rebuild(base_bytes, slurp(pf), rebuilt, why) && rebuilt == full_bytes,
++                  "delta: the parked delta rebuilds the same full file");
++        }
++        if (const char* out = std::getenv("STRATA_KV_VECTORS_DIR")) {   // the small vector set for other implementations
++            const fs::path o = out;
++            fs::create_directories(o);
++            fs::copy_file(basef, o / "small-base.strsess", fs::copy_options::overwrite_existing);
++            fs::copy_file(deltaf, o / "small-delta.strsdlt", fs::copy_options::overwrite_existing);
++            fs::copy_file(fullf, o / "small-full.strsess", fs::copy_options::overwrite_existing);
++            std::ofstream m(o / "small-expected.txt");
++            m << std::hex << "base_save_id " << d.base << "\nnew_save_id " << d.id << "\nfull_size " << std::dec
++              << full_bytes.size() << "\nfull_payload_hash " << std::hex << rd64(full_bytes, full_bytes.size() - 16)
++              << "\ndelta_size " << std::dec << delta_bytes.size() << "\n";
++        }
++    }
+     // writing twice produces the same bytes (deterministic format)
+     {
+         const fs::path again = dir / "again.bin";
+diff --git a/src/core/session_delta_file.hpp b/src/core/session_delta_file.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..68ac88d194735a58531b352e7d4a00f82b9f4393
+--- /dev/null
++++ b/src/core/session_delta_file.hpp
+@@ -0,0 +1,113 @@
++// src/core/session_delta_file.hpp - kv-export: the delta file writer's own pieces (STRSDLT v1), private to
++// conversation_file.cpp.  Pure host code: no CUDA.
++//
++// conversation_file.cpp writes a delta file through the same walk as a session file (write_impl, put_payload,
++// Out::source), so the places where the two differ stay woven into those functions, each marked "kv-export".  What
++// stands on its own lives here, so an upstream merge of conversation_file.cpp meets a few lines instead of these
++// definitions: the delta file's magic, end mark and 80-byte header, a host image's K/V as sources (so an image can be
++// hashed in chunks or written as a delta), the check of a delta's keep values, and the chunk hasher a K/V part's
++// bytes pass through.  The types the options carry (SessionDelta, SessionKvChunks, kSessionChunk) are public, in
++// include/strata/core/session_delta.hpp.  KV-EXPORT.md documents the format; it is a contract, byte for byte.
++#pragma once
++
++#include "strata/core/conversation_file.hpp"
++
++#include <algorithm>
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <string>
++#include <vector>
++
++namespace strata::core::session_delta_detail {
++
++// kv-export: delta files (STRSDLT v1): an 80-byte header, the same trailer size
++inline constexpr char kDeltaMagic[8] = {'S', 'T', 'R', 'S', 'D', 'L', 'T', '\x01'};
++inline constexpr char kDeltaEnd[8] = {'S', 'T', 'R', 'S', 'D', 'E', 'N', 'D'};
++inline constexpr size_t kDeltaHeader = 80;
++
++// kv-export: the 80-byte STRSDLT v1 header
++inline void delta_header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload, const SessionDelta& d,
++                               uint64_t full_size) {
++    std::memset(h, 0, kDeltaHeader);
++    std::memcpy(h, kDeltaMagic, 8);
++    const uint32_t version = 1, size = kDeltaHeader;
++    std::memcpy(h + 8, &version, 4);
++    std::memcpy(h + 12, &size, 4);
++    std::memcpy(h + 16, &id.model, 8);
++    std::memcpy(h + 24, &id.config, 8);
++    std::memcpy(h + 32, &payload, 8);
++    std::memcpy(h + 40, &d.base, 8);
++    std::memcpy(h + 48, &d.id, 8);
++    std::memcpy(h + 56, &full_size, 8);
++    const uint64_t hh = session_hash64(h, 72, 0);
++    std::memcpy(h + 72, &hh, 8);
++}
++
++// kv-export: an image's own K/V as sources, so a host image can be hashed in chunks or written as a delta
++inline std::vector<SessionKvSource> image_sources(const SavedConversation& image) {
++    std::vector<SessionKvSource> out;
++    for (const auto& k : image.kv) {
++        SessionKvSource s;
++        s.format = k.format; s.cells = k.cells; s.heads = k.heads; s.head_dim = k.head_dim;
++        s.page_size = k.page_size; s.pooled_rows = k.pooled_rows; s.idx_dim = k.idx_dim;
++        const std::array<const ConversationBuffer*, 5> parts = {&k.k, &k.v, &k.k_scale, &k.v_scale, &k.pooled};
++        for (size_t i = 0; i < 5; ++i) s.sizes[i] = parts[i]->size();
++        s.read = [parts](size_t part, size_t offset, void* dst, size_t n) {
++            if (part >= 5 || offset > parts[part]->size() || n > parts[part]->size() - offset) return false;
++            uint8_t* d = static_cast<uint8_t*>(dst);
++            return parts[part]->visit(offset, n, [&](const uint8_t* p, size_t c, size_t at) {
++                std::memcpy(d + (at - offset), p, c);
++                return true;
++            });
++        };
++        s.error = [] { return std::string("K/V read out of range"); };
++        out.push_back(std::move(s));
++    }
++    return out;
++}
++
++// kv-export: a delta's keep values against its sources: whole chunks, within the part and the base's chunks
++inline bool delta_valid(const SessionDelta& d, const std::vector<SessionKvSource>& kv, std::string& error) {
++    if (!d.id || !d.base_chunks || d.keep.size() != kv.size() || d.base_chunks->size() != kv.size()) {
++        error = "session file: the delta does not describe these K/V layers";
++        return false;
++    }
++    for (size_t j = 0; j < kv.size(); ++j)
++        for (size_t p = 0; p < 5; ++p) {
++            const uint64_t keep = d.keep[j][p];
++            if (keep % kSessionChunk || keep > kv[j].sizes[p] || keep / kSessionChunk > (*d.base_chunks)[j][p].size()) {
++                error = "session file: delta keep " + std::to_string(keep) + " of layer " + std::to_string(j) +
++                        " part " + std::to_string(p) + " is not whole chunks of both the part and the base";
++                return false;
++            }
++        }
++    return true;
++}
++
++// kv-export: the chunk hashes of one K/V part as its bytes pass (Out::source): the session_hash64 (seed 0) of each
++// kSessionChunk bytes, the last chunk possibly shorter.  A delta's kept bytes are the base's, so their hashes are the
++// base's first keep / kSessionChunk, taken over without reading those bytes.
++struct KvChunkHasher {
++    std::vector<uint64_t> list;
++    SessionHasher piece{0};
++    size_t in_piece = 0;
++    void start(size_t n_chunks, const SessionDelta* delta, size_t layer, size_t part, size_t keep) {
++        list.reserve(n_chunks);
++        if (keep) list.assign(delta->base_chunks->at(layer)[part].begin(),
++                              delta->base_chunks->at(layer)[part].begin() + (ptrdiff_t) (keep / kSessionChunk));
++    }
++    void update(const uint8_t* p, size_t c) {
++        while (c) {
++            const size_t t = std::min<size_t>(c, kSessionChunk - in_piece);
++            piece.update(p, t);
++            in_piece += t; p += t; c -= t;
++            if (in_piece == kSessionChunk) { list.push_back(piece.digest()); piece = SessionHasher(0); in_piece = 0; }
++        }
++    }
++    // the last, shorter chunk (after a part that ended without error)
++    void finish() { if (in_piece) list.push_back(piece.digest()); }
++};
++
++} // namespace strata::core::session_delta_detail
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 7416f4e1d5fb9e590fa11c079cde6e6c6a5c177f..703541b419c9af4e4a60f5665c2967b46de96932 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -101,6 +101,7 @@
+ #include "strata/program/batch_read.hpp"
+ #include "strata/program/logits_selection.hpp"
+ #include "strata/program/conv_cache.hpp"
++#include "strata/program/kv_export.hpp"   // kv-export: HELD, SAVEC, SAVEX, IMPORT
+ #include "strata/program/split_rules.hpp"
+ #include "strata/program/stage_reserve.hpp"
+ #include "strata/program/split_walk.hpp"
+@@ -12048,6 +12049,8 @@ int main(int argc, char** argv) {
+         strata::core::ConversationCache conversations(
+             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
+             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
++        // kv-export: what every SAVEX wrote, so a later save of the same conversation can write a delta against it
++        strata::program::kv_export::SaveLineages lineages;
+         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
+         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
+         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
+@@ -15563,14 +15566,28 @@ int main(int argc, char** argv) {
+             // (fingerprint file, state capture, file flush, rename + folder flush, validation, device transfer):
+             // that step is allowed <seconds> (session_phase_limit_s) by the watchdog and by the server, no more.
+             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
+-            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
++            // kv-export: HELD, SAVEC, SAVEX and IMPORT move a conversation between hosts (kv_export.hpp, KV-EXPORT.md).
++            if (line.rfind("HELD ", 0) == 0) {
++                strata::program::kv_export::held(line, live_ok, live, bs, conversations);
++                continue;
++            }
++            const bool savex = line.rfind("SAVEX ", 0) == 0;
++            const bool savec = line.rfind("SAVEC ", 0) == 0 || savex;
++            if (line.rfind("SAVE ", 0) == 0 || savec || line.rfind("RESTORE ", 0) == 0 || line.rfind("IMPORT ", 0) == 0) {
+                 const bool save = line[0] == 'S';
+-                const std::string path = line.substr(save ? 5 : 8);
++                const bool import = line[0] == 'I';
++                strata::program::kv_export::SaveCommand kvc;   // SAVEC / SAVEX
++                std::string path;
++                if (savec) {
++                    if (!strata::program::kv_export::parse_save(line, savex, kvc, path)) continue;
++                } else {
++                    path = line.substr(save ? 5 : import ? 7 : 8);
++                }
+                 const auto t0 = Clock::now();
+                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
+                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
+                                   bool published = false) {
+-                    std::fprintf(stderr, "strata serve: session %s %s: %s\n", save ? "save" : "restore", path.c_str(),
++                    std::fprintf(stderr, "strata serve: session %s %s: %s\n", save ? "save" : import ? "import" : "restore", path.c_str(),
+                                  why.c_str());
+                     std::string one = why;   // one protocol line
+                     for (char& c : one) if (c == '\n' || c == '\r') c = ' ';
+@@ -15601,7 +15618,11 @@ int main(int argc, char** argv) {
+                 if (path.empty()) { refuse("missing path"); continue; }
+                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
+                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
+-                if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
++                if (o.batch > 0 && !import && !savec) { refuse("session files do not support --batch (parallel requests)"); continue; }
++                if (import && !conversations.enabled()) {
++                    refuse("IMPORT parks the conversation: it needs --conversation-cache-mib > 0");
++                    continue;
++                }
+                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
+                 if (!ver.wait_commit(err)) {
+                     std::printf("ERR %s\n", err.c_str());
+@@ -15621,9 +15642,25 @@ int main(int argc, char** argv) {
+                     continue;
+                 }
+                 if (save) {
+-                    if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
++                    // kv-export: what is saved: the live session, or (SAVEC) an idle batch slot's
++                    strata::program::kv_export::SaveSource src{&live, &live_imgs, &checks, cvec_cached, live_ok, &ss,
++                                                               &mtp.kv_state()};
++                    if (savec && kvc.slot >= 0 &&
++                        !strata::program::kv_export::slot_source(kvc, bs, !stages.empty(), bslot_ss, batch_mtp, slot_mtp,
++                                                                 src, refuse))
++                        continue;
++                    if (savec && !(src.ok && strata::program::kv_export::names(kvc, *src.ids))) {
++                        // kv-export: the live session moved on: save the longest parked conversation it names
++                        strata::program::kv_export::save_parked(path, kvc, savex, conversations, lineages, id, err,
++                                                                (uint64_t) o.session_min_free_mib << 20, moving, blocking,
++                                                                refuse, ms);
++                        continue;
++                    }
++                    if (!src.ok || src.ids->empty()) { refuse("no complete session to save"); continue; }
+                     size_t bytes = 0, kept = 0;
+-                    double capture_ms = 0;
++                    double capture_ms = 0, checks_ms = 0;   // kv-export: where a save's pause goes
++                    strata::core::SessionStatus save_st;
++                    strata::program::kv_export::SaveX save_x;   // SAVEX
+                     try {
+                         // RAM PREFLIGHT for the save (not a reservation), BEFORE anything is copied: the deepest
+                         // checkpoint is chosen by reference, and the copies it will take (the list below and the one
+@@ -15636,18 +15673,18 @@ int main(int argc, char** argv) {
+                             strata::core::ConversationStateSizes z;
+                             std::string why;
+                             uint64_t state = UINT64_MAX;   // unknown sizes: the preflight refuses rather than guesses
+-                            if (strata::core::conversation_session_sizes(g, ss, z, why)) {
+-                                const uint64_t q = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0);
++                            if (strata::core::conversation_session_sizes(g, *src.ss, z, why)) {
++                                const uint64_t q = (uint64_t) std::max<int64_t>(src.ss->qsa_alloc, 0);
+                                 const uint64_t per = (uint64_t) z.tail + z.dead + z.block_pos;
+                                 if (q == 0 || per <= (UINT64_MAX - z.gdn - z.ple) / q) state = z.gdn + z.ple + q * per;
+                             }
+                             sl.state_bytes = state;
+-                            sl.tokens = live.size();
+-                            sl.images = live_imgs.size();
+-                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
++                            sl.tokens = src.ids->size();
++                            sl.images = src.imgs->size();
++                            sl.kv_layers = (uint64_t) std::max<int64_t>(src.ss->qsa_alloc, 0) + 1;
+                         }
+                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+-                        if (o.session_save_reclaim) {
++                        if (o.session_save_reclaim && src.ss == &ss) {
+                             const auto freed = strata::core::session_save_reclaim(
+                                 checks, conversations, sl, floor, strata::core::available_host_bytes);
+                             if (freed.bytes || freed.checkpoints || freed.parked) {
+@@ -15670,19 +15707,28 @@ int main(int argc, char** argv) {
+                                   " MiB needed, " + ram_note(mem) + ")";
+                             return false;
+                         };
+-                        std::vector<ConvCheckpoint> disk_checks;
++                        // kv-export: the deepest checkpoint goes into the file by reference (the chain is not
++                        // touched while the engine writes), so nothing is copied for it: the preflight counts no copy
++                        const ConvCheckpoint* deepest = strata::core::session_deepest_checkpoint(*src.checks);
+                         std::string why;
+-                        if (!strata::core::session_save_checkpoints(checks, sl, admit, disk_checks, why)) {
++                        if (!admit(strata::core::session_save_peak_bytes(nullptr, sl), why)) {
+                             refuse(why, strata::core::SessionError::memory);
+                             continue;
+                         }
+-                        kept = disk_checks.size();
+-                        const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
++                        if (deepest && !strata::program::kv_export::deepest_fits(src, *deepest, [&](const ConvCheckpoint& c) {
++                                return strata::core::conversation_checkpoint_validate(c, *src.ss, g, err); })) {
++                            refuse(err.empty() ? std::string("the deepest checkpoint is not a live token prefix") : err);
++                            continue;
++                        }
++                        kept = deepest ? 1 : 0;
++                        checks_ms = ms();
++                        static const std::vector<ConvCheckpoint> no_checks;
++                        const strata::core::ConversationView view{*src.ids, *src.imgs, no_checks, src.cvec};
+                         strata::core::SavedConversation meta;
+                         std::vector<strata::core::SessionKvSource> sources;
+                         // the live running state comes off the device in one synchronous copy
+                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
+-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
++                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, *src.ss, g, *src.draft,
+                                                                          err)) {
+                             refuse(err, strata::core::SessionError::io);
+                             continue;
+@@ -15692,7 +15738,12 @@ int main(int argc, char** argv) {
+                         wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
+                         wo.progress = moving;
+                         wo.phase = blocking;
+-                        strata::core::SessionStatus st;
++                        wo.checkpoints.emplace();
++                        if (deepest) wo.checkpoints->push_back(deepest);
++                        if (savex)
++                            lineages.prepare(save_x, kvc.base, *src.ids, src.cvec, !src.imgs->empty(),
++                                             strata::program::kv_export::SaveLineages::geo_of_sources(sources), wo);
++                        strata::core::SessionStatus& st = save_st;
+                         if (!strata::core::session_file_write(path, meta, sources, id, bytes, err, wo, &st)) {
+                             refuse(err, st.error, st.published);
+                             continue;
+@@ -15704,10 +15755,13 @@ int main(int argc, char** argv) {
+                         refuse("not enough RAM to save the session", strata::core::SessionError::memory);
+                         continue;
+                     }
+-                    std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
+-                                 "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
+-                                 path.c_str(), ms(), capture_ms);
+-                    std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
++                    const double total_ms = ms();
++                    std::fprintf(stderr, "strata serve: session saved %zu tokens%s, %zu of %zu checkpoints, %zu bytes to %s "
++                                 "in %.1f ms (state %.1f ms: checkpoints %.1f, live %.1f; write %.1f ms: K/V reads %.1f, "
++                                 "disk %.1f)\n", src.ids->size(), save_x.delta ? " (delta)" : "", kept, src.checks->size(), bytes, path.c_str(), total_ms,
++                                 capture_ms, checks_ms, capture_ms - checks_ms, total_ms - capture_ms,
++                                 save_st.source_ms, save_st.disk_ms);
++                    lineages.answer(savex, save_x, kvc.base, *src.ids, src.cvec, !src.imgs->empty(), bytes, ms);
+                 } else {
+                     strata::core::SavedConversation image;
+                     size_t bytes = 0;
+@@ -15749,6 +15803,10 @@ int main(int argc, char** argv) {
+                         refuse(err);
+                         continue;
+                     }
++                    if (import) {   // kv-export: park it instead
++                        strata::program::kv_export::park_import(image, bytes, read_ms, path, conversations, refuse, ms);
++                        continue;
++                    }
+                     // the elastic K/V (--kv-grow) maps only the cells it has grown to: make room for the file's cells
+                     if (!kvg_ensure((int64_t) image.live.ids.size() + 256, adapt_quiesce)) {
+                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
