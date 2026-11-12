@@ -5,6 +5,7 @@ solo and with parallel requests (mock engine: no GPU, no pack).
 """
 from __future__ import annotations
 
+import collections
 import json
 import queue
 import sys
@@ -87,7 +88,9 @@ class FakeEngine(StrataEngine):
         self.slot_cv = threading.Condition()
         self.waiting = 0
         self.admitting = 0
+        self.par_counters = {"queued": 0, "queue_wait_s": 0.0}
         self.wait_lens = []
+        self.arrivals = collections.deque(maxlen=64)
         self.ctl_epoch = 0
         self.ctl = threading.Lock()
         self.wlock = threading.Lock()
