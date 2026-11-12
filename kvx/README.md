@@ -3,7 +3,8 @@
 `kvx/` turns this branch's kv-export work (see `KV-EXPORT.md`) into something that can be injected
 into a build of any upstream Strata release: two patches, a script that applies them, and a
 script that checks out a release, applies them, runs the tests and builds the image. The
-directory is not part of the patches; it exists only on branch `kv-export-hooks`.
+directory is not part of the patches; it exists only on the fork's branches
+(`kv-export-hooks`, and `kv-export-0.2.13` from tag `v0.2.13-kvx2` on).
 
 ```
 kvx/
