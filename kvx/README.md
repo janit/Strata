@@ -1,5 +1,7 @@
 # kvx: kv-export as a patch overlay
 
+> **Moved: the overlay now lives on branch kvx; this branch is frozen at v0.2.13-kvx2.**
+
 `kvx/` turns this branch's kv-export work (see `KV-EXPORT.md`) into something that can be injected
 into a build of any upstream Strata release: two patches, a script that applies them, and a
 script that checks out a release, applies them, runs the tests and builds the image. The

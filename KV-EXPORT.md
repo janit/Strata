@@ -1,5 +1,7 @@
 # kv-export (fork of Strata)
 
+> **Moved: the overlay now lives on branch kvx; this branch is frozen at v0.2.13-kvx2.**
+
 Branch `kv-export-0.2.13` of github.com/janit/Strata, based on Strata v0.2.13.1 (tag `v0.2.13-kvx1`; branches
 `kv-export-0.2.6`, `kv-export-0.2` and `kv-export` are the same work on v0.2.6, v0.2.3.1 and v0.1.45). It adds what a
 serving fleet needs to move a conversation between Strata processes on different hosts. Everything
