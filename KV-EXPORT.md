@@ -1,7 +1,7 @@
 # kv-export (fork of Strata)
 
-Branch `kv-export-0.2` of github.com/janit/Strata, based on Strata v0.2.3.1 (7ddc17a; branch `kv-export` is the same work
-on v0.1.45). It adds what a
+Branch `kv-export-0.2.13` of github.com/janit/Strata, based on Strata v0.2.13.1 (tag `v0.2.13-kvx1`; branches
+`kv-export-0.2.6`, `kv-export-0.2` and `kv-export` are the same work on v0.2.6, v0.2.3.1 and v0.1.45). It adds what a
 serving fleet needs to move a conversation between Strata processes on different hosts. Everything
 else behaves exactly as upstream does.
 
@@ -198,6 +198,23 @@ The server remembers the prompt of each session's last request so that it can fi
 conversation again. It keeps the last 1024 sessions, packed as int32 (4 bytes a token), with at
 most 64 MiB in total; the oldest go first. It hashes a prompt before taking the control lines (36
 ms per 50k tokens), not while holding them.
+
+## On v0.2.13.1
+
+Merged from v0.2.6-kvx2. Upstream's #4451 made `vram()` and `session_file()` take a `--batch`
+engine's control lines themselves, the same fix this fork had made for its own save, held and import
+calls (`with_control`). `session_file()` now does that through upstream's `_exclusive_control()`, and
+`with_control` marks the lines held (`_ctl_held`, as upstream's `Service.vram` does) so the call
+inside does not wait for lines its own thread holds. No change to the commands, the file formats or
+the HTTP API.
+
+Checked on forge-white (RTX 5090, IQ3_XXS, parallel 4, int8 KV): a 31k-token conversation saved by
+session (709 MB in 0.66 s), a delta after one more turn (246 MB in 0.27 s, against that base), then
+the engine restarted, the full file imported (0.66 s), and the next turn went on in 0.40 s with
+30,946 of 30,986 tokens cached against 9.4 s cold. The serve suite (1,524 tests), the kv-export
+tests and the CPU session-file tests (351 checks) pass. After a restart a held query **by session**
+answers 0 even for an imported conversation (the new server has no prompt remembered for that
+session); a caller asks by `{n, hash}`, as viiwork does.
 
 ## On v0.2.3.1
 
