@@ -69,7 +69,8 @@ jobs:
               echo '```'
               grep -E '^(apply|kvx): |checks passed|passed|failed|error' "$RUNNER_TEMP/build.log" | head -n 30
               echo '```'
-              grep -q '3-way merge' "$RUNNER_TEMP/build.log" &&
+              if grep -q '3-way merge' "$RUNNER_TEMP/build.log"; then
                 echo '**Applied only with a 3-way merge:** regenerate the patches (./dev.sh, ./make-patches.sh).'
+              fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"
