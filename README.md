@@ -291,3 +291,11 @@ need no extra source.
 "Clean" means `git apply` without a 3-way merge. Built with CUDA: v0.2.13.1 with dsv41 (archs
 86;89;120, from the frozen branch), and the overlay's own `build.sh v0.2.13.1 --target engine-build`
 (arch 120). For the other two refs the CUDA compile of `generate.cpp` was not checked.
+
+The table is the state on the day it was written. `.github/workflows/upstream-check.yml` repeats the
+check every Monday and on each push to this branch: BASE, upstream's newest `v*` tag and upstream
+`main`, each with both patches (`build.sh <ref> --with-dsv41 --no-build`), then upstream's own serve
+suite on the patched tree (`tools/check --only py-serve`). A red run, or a summary that says a ref
+took only a 3-way merge, means the patches need the flow above. It builds no image and compiles no
+CUDA, so a hook that still applies but no longer compiles shows up only in `build.sh --target
+engine-build`.

@@ -1,0 +1,76 @@
+# Does the overlay still fit upstream?  Weekly, and on every push to kvx: apply the patches (both, --with-dsv41) to
+# BASE, upstream's newest tag and upstream main, then run the kv-export CPU tests and upstream's serve suite on the
+# patched tree.  No image is built (no GPU here); a failure means the patches need ./dev.sh + ./make-patches.sh.
+name: upstream-check
+
+on:
+  schedule:
+    - cron: '17 5 * * 1'        # Mondays 05:17 UTC
+  push:
+    branches: [kvx]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refs:
+    runs-on: ubuntu-24.04
+    outputs:
+      refs: ${{ steps.refs.outputs.refs }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: refs
+        name: BASE, newest upstream tag, main
+        run: |
+          base=$(tr -d '[:space:]' < BASE)
+          newest=$(git ls-remote --tags --refs https://github.com/Niko1221/Strata.git 'v*' |
+                   sed 's|.*refs/tags/||' | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -V | tail -n 1)
+          refs=$(printf '%s\n' "$base" "$newest" main | awk 'NF && !seen[$0]++' | jq -Rnc '[inputs]')
+          echo "refs=$refs" >> "$GITHUB_OUTPUT"
+          echo "checking: $refs"
+
+  check:
+    needs: refs
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ${{ fromJSON(needs.refs.outputs.refs) }}
+    name: ${{ matrix.ref }}
+    env:
+      KVX_SCRATCH: ${{ runner.temp }}/kvx
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: upstream's Python requirements at ${{ matrix.ref }}
+        run: |
+          for f in requirements.txt requirements-dev.txt; do
+            curl -fsSL "https://raw.githubusercontent.com/Niko1221/Strata/${{ matrix.ref }}/$f" -o "$RUNNER_TEMP/$f"
+          done
+          python -m pip install -q -r "$RUNNER_TEMP/requirements.txt" -r "$RUNNER_TEMP/requirements-dev.txt"
+      - name: apply the overlay and run the kv-export tests
+        run: |
+          set -o pipefail
+          ./build.sh "${{ matrix.ref }}" --with-dsv41 --no-build 2>&1 | tee "$RUNNER_TEMP/build.log"
+      - name: upstream's serve suite on the patched tree (tools/check --only py-serve)
+        run: |
+          safe=$(printf '%s' "${{ matrix.ref }}" | tr -c 'A-Za-z0-9._-' '-')
+          cd "$KVX_SCRATCH/$safe/src"
+          # one retry: a few of upstream's timing tests are flaky on a busy runner (they fail on plain upstream too)
+          python tools/check --only py-serve || python tools/check --only py-serve
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.ref }}"
+            if [ -f "$RUNNER_TEMP/build.log" ]; then
+              echo '```'
+              grep -E '^(apply|kvx): |checks passed|passed|failed|error' "$RUNNER_TEMP/build.log" | head -n 30
+              echo '```'
+              grep -q '3-way merge' "$RUNNER_TEMP/build.log" &&
+                echo '**Applied only with a 3-way merge:** regenerate the patches (./dev.sh, ./make-patches.sh).'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
