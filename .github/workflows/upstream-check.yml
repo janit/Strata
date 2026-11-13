@@ -38,10 +38,9 @@ jobs:
       matrix:
         ref: ${{ fromJSON(needs.refs.outputs.refs) }}
     name: ${{ matrix.ref }}
-    env:
-      KVX_SCRATCH: ${{ runner.temp }}/kvx
     steps:
       - uses: actions/checkout@v4
+      - run: echo "KVX_SCRATCH=$RUNNER_TEMP/kvx" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
