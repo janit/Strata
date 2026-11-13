@@ -69,7 +69,7 @@ jobs:
               echo '```'
               grep -E '^(apply|kvx): |checks passed|passed|failed|error' "$RUNNER_TEMP/build.log" | head -n 30
               echo '```'
-              if grep -q '3-way merge' "$RUNNER_TEMP/build.log"; then
+              if grep -qE '^apply: .*(applies|applied) with a 3-way merge' "$RUNNER_TEMP/build.log"; then
                 echo '**Applied only with a 3-way merge:** regenerate the patches (./dev.sh, ./make-patches.sh).'
               fi
             fi
